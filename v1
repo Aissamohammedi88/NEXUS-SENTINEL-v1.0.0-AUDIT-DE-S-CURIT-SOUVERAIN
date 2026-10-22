@@ -1,0 +1,1296 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+================================================================================
+NEXUS-SENTINEL v1.0.0 — AUDIT DE SÉCURITÉ SOUVERAIN
+================================================================================
+Architecte : Aissa Mohammedi (DGK) / Héritier Naim
+Rôle : Alternative fiable aux outils GitHub (CodeQL, Dependabot, Secret
+Scanning, Branch Protection, GitHub Actions).
+Philosophie: Multi-moteurs. Preuves > Affirmations. Zéro faux positif.
+Souverain. Auditable.
+Architecture: Ingestion -> Analyse (Multi-Moteurs) -> Cross-Check -> Rapport.
+================================================================================
+"""
+
+import os
+import sys
+import subprocess
+import json
+import time
+import re
+import shutil
+import sqlite3
+import argparse
+import logging
+import traceback
+import hashlib
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Tuple
+from dataclasses import dataclass, field, asdict
+from abc import ABC, abstractmethod
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+# --- Imports pour l'interface TUI ---
+try:
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.syntax import Syntax
+RICH_AVAILABLE = True
+except ImportError:
+RICH_AVAILABLE = False
+
+# --- Imports YAML ---
+try:
+import yaml
+YAML_AVAILABLE = True
+except ImportError:
+YAML_AVAILABLE = False
+
+# ==============================================================================
+# SECTION 1 : CONFIGURATION GLOBALE
+# ==============================================================================
+
+class SentinelConfig:
+VERSION = "1.0.0"
+ARCHITECTE = "Aissa Mohammedi (DGK)"
+HERITIER = "Naim Mohammedi"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(BASE_DIR, "sentinel_logs")
+WORKSPACE_DIR = os.path.join(BASE_DIR, "sentinel_workspace")
+DB_PATH = os.path.join(BASE_DIR, "sentinel_audit.db")
+RULES_DIR = os.path.join(BASE_DIR, "sentinel_rules")
+
+# Limites
+MAX_FILE_SIZE = 5 * 1024 * 1024 # 5 MB
+MAX_REPO_SIZE = 500 * 1024 * 1024 # 500 MB
+TIMEOUT = 300
+
+# Extensions à analyser
+CODE_EXTENSIONS = {
+'.py': 'python', '.js': 'javascript', '.ts': 'typescript',
+'.java': 'java', '.go': 'go', '.rb': 'ruby', '.php': 'php',
+'.c': 'c', '.cpp': 'cpp', '.h': 'c', '.cs': 'csharp',
+'.sh': 'bash', '.yml': 'yaml', '.yaml': 'yaml'
+}
+
+# Patterns de secrets (basés sur l'analyse)
+SECRET_PATTERNS = {
+'AWS_KEY': r'(?i)aws_access_key_id\s*=\s*["\']?([A-Z0-9]{20})["\']?',
+'GITHUB_TOKEN': r'(?i)gh[pousr]_[A-Za-z0-9_]{36,255}',
+'SLACK_TOKEN': r'xox[baprs]-([0-9a-zA-Z]{10,48})',
+'PRIVATE_KEY': r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----',
+'GOOGLE_API': r'AIza[0-9A-Za-z\-_]{35}',
+'STRIPE_KEY': r'sk_live_[0-9a-zA-Z]{24}',
+}
+
+# Création des répertoires
+for directory in [SentinelConfig.LOG_DIR, SentinelConfig.WORKSPACE_DIR, SentinelConfig.RULES_DIR]:
+os.makedirs(directory, exist_ok=True)
+
+# ==============================================================================
+# SECTION 2 : SYSTÈME DE LOGGING
+# ==============================================================================
+
+def setup_logging() -> logging.Logger:
+logger = logging.getLogger("NEXUS_SENTINEL")
+logger.setLevel(logging.DEBUG)
+
+if logger.handlers:
+return logger
+
+formatter = logging.Formatter(
+'%(asctime)s | %(levelname)-8s | %(name)-10s | %(message)s',
+datefmt='%H:%M:%S'
+)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+log_file = os.path.join(SentinelConfig.LOG_DIR, "sentinel.log")
+file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+return logger
+
+logger = setup_logging()
+console = Console() if RICH_AVAILABLE else None
+
+# ==============================================================================
+# SECTION 3 : AUTO-INSTALLATION DES DÉPENDANCES
+# ==============================================================================
+
+def install_system_dependencies():
+"""Installe les dépendances système."""
+logger.info("Vérification des dépendances système...")
+
+# Vérifier les binaires
+binaries = {
+"semgrep": ["semgrep", "--version"],
+"trivy": ["trivy", "--version"],
+"gitleaks": ["gitleaks", "version"],
+"bandit": ["bandit", "--version"],
+}
+
+missing = []
+for name, cmd in binaries.items():
+try:
+subprocess.run(cmd, capture_output=True, timeout=10)
+except (FileNotFoundError, subprocess.TimeoutExpired):
+missing.append(name)
+
+if missing:
+logger.warning(f"Binaires manquants : {missing}")
+
+# Installation via pip pour semgrep et bandit
+pip_packages = []
+if "semgrep" in missing:
+pip_packages.append("semgrep")
+if "bandit" in missing:
+pip_packages.append("bandit")
+
+if pip_packages:
+logger.info(f"Installation via pip : {pip_packages}")
+try:
+subprocess.run([sys.executable, "-m", "pip", "install", "--quiet"] + pip_packages, check=True)
+except subprocess.CalledProcessError as e:
+logger.error(f"Échec installation pip : {e}")
+
+# Pour trivy et gitleaks, on affiche les instructions
+if "trivy" in missing:
+logger.warning("Trivy non installé. Installez-le depuis https://trivy.dev/")
+if "gitleaks" in missing:
+logger.warning("Gitleaks non installé. Installez-le depuis https://github.com/gitleaks/gitleaks")
+else:
+logger.info("✅ Dépendances système présentes.")
+
+def install_python_dependencies():
+"""Installe les librairies Python."""
+logger.info("Vérification des librairies Python...")
+
+required = {
+"requests": "requests",
+"yaml": "pyyaml",
+"rich": "rich",
+"jinja2": "jinja2"
+}
+
+missing = []
+for module, package in required.items():
+try:
+__import__(module)
+except ImportError:
+missing.append(package)
+
+if missing:
+logger.info(f"Installation : {missing}")
+try:
+subprocess.run([sys.executable, "-m", "pip", "install", "--quiet"] + missing, check=True)
+logger.info("✅ Librairies Python installées.")
+except subprocess.CalledProcessError as e:
+logger.error(f"Échec installation : {e}")
+sys.exit(1)
+
+# ==============================================================================
+# SECTION 4 : MODÈLES DE DONNÉES
+# ==============================================================================
+
+@dataclass
+class Finding:
+"""Représente une vulnérabilité trouvée."""
+id: str
+title: str
+severity: str # CRITICAL, HIGH, MEDIUM, LOW, INFO
+category: str # SAST, SECRET, DEPENDENCY, WORKFLOW, CONFIG
+file_path: str
+line_number: int
+code_snippet: str
+description: str
+cve: Optional[str] = None
+reference: Optional[str] = None
+confidence: str = "HIGH" # HIGH, MEDIUM, LOW
+source_tool: str = "unknown"
+remediation: str = ""
+timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+def to_dict(self) -> Dict:
+return asdict(self)
+
+@dataclass
+class AuditReport:
+"""Rapport complet d'audit."""
+target: str
+timestamp: str
+duration: float
+files_analyzed: int
+findings: List[Finding]
+stats: Dict[str, Any]
+errors: List[str] = field(default_factory=list)
+
+def to_dict(self) -> Dict:
+return {
+"target": self.target,
+"timestamp": self.timestamp,
+"duration": self.duration,
+"files_analyzed": self.files_analyzed,
+"findings": [f.to_dict() for f in self.findings],
+"stats": self.stats,
+"errors": self.errors
+}
+
+# ==============================================================================
+# SECTION 5 : BASE DE DONNÉES SQLITE
+# ==============================================================================
+
+class SentinelDatabase:
+"""Gère la persistance des audits dans SQLite."""
+
+def __init__(self, db_path: str = SentinelConfig.DB_PATH):
+self.db_path = db_path
+self.conn = None
+self._init_db()
+
+def _init_db(self):
+"""Initialise le schéma."""
+try:
+self.conn = sqlite3.connect(self.db_path)
+cursor = self.conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS audits (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+target TEXT NOT NULL,
+timestamp TEXT NOT NULL,
+duration REAL,
+files_analyzed INTEGER,
+total_findings INTEGER,
+critical_count INTEGER,
+high_count INTEGER,
+medium_count INTEGER,
+low_count INTEGER,
+report_json TEXT
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS findings (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+audit_id INTEGER,
+finding_id TEXT,
+title TEXT,
+severity TEXT,
+category TEXT,
+file_path TEXT,
+line_number INTEGER,
+cve TEXT,
+source_tool TEXT,
+FOREIGN KEY (audit_id) REFERENCES audits(id)
+)
+""")
+
+self.conn.commit()
+logger.debug(f"Base de données initialisée : {self.db_path}")
+except sqlite3.Error as e:
+logger.error(f"Erreur DB : {e}")
+
+def save_audit(self, report: AuditReport) -> int:
+"""Sauvegarde un audit complet."""
+if not self.conn:
+return -1
+
+cursor = self.conn.cursor()
+
+stats = report.stats
+cursor.execute("""
+INSERT INTO audits (target, timestamp, duration, files_analyzed,
+total_findings, critical_count, high_count, medium_count, low_count, report_json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (
+report.target, report.timestamp, report.duration, report.files_analyzed,
+len(report.findings),
+stats.get("CRITICAL", 0), stats.get("HIGH", 0),
+stats.get("MEDIUM", 0), stats.get("LOW", 0),
+json.dumps(report.to_dict())
+))
+
+audit_id = cursor.lastrowid
+
+for finding in report.findings:
+cursor.execute("""
+INSERT INTO findings (audit_id, finding_id, title, severity, category, file_path, line_number, cve, source_tool)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (
+audit_id, finding.id, finding.title, finding.severity, finding.category,
+finding.file_path, finding.line_number, finding.cve, finding.source_tool
+))
+
+self.conn.commit()
+logger.info(f"Audit sauvegardé en DB (ID: {audit_id})")
+return audit_id
+
+def get_previous_audit(self, target: str) -> Optional[Dict]:
+"""Récupère le dernier audit pour un target donné."""
+if not self.conn:
+return None
+
+cursor = self.conn.cursor()
+cursor.execute("""
+SELECT report_json FROM audits
+WHERE target = ?
+ORDER BY timestamp DESC LIMIT 1
+""", (target,))
+
+row = cursor.fetchone()
+if row:
+return json.loads(row[0])
+return None
+
+def close(self):
+if self.conn:
+self.conn.close()
+
+# ==============================================================================
+# SECTION 6 : MODULE 1 — INGESTION
+# ==============================================================================
+
+class Ingestor:
+"""Clonage et analyse de la structure du dépôt."""
+
+def __init__(self):
+self.workspace = SentinelConfig.WORKSPACE_DIR
+
+def ingest(self, target: str) -> Tuple[str, Dict[str, Any]]:
+"""
+Clone le dépôt ou analyse le dossier local.
+Retourne (chemin_local, métadonnées).
+"""
+logger.info(f"📥 Ingestion de : {target}")
+
+# Nettoyage du workspace
+repo_name = self._get_repo_name(target)
+local_path = os.path.join(self.workspace, repo_name)
+
+if os.path.exists(local_path):
+logger.info(f"Suppression de l'ancien workspace : {local_path}")
+shutil.rmtree(local_path, ignore_errors=True)
+
+# Détection : local ou distant
+if os.path.isdir(target):
+logger.info(f"Dossier local détecté : {target}")
+shutil.copytree(target, local_path)
+elif target.startswith(("http://", "https://", "git@")):
+logger.info(f"Dépôt distant détecté : {target}")
+self._clone_repo(target, local_path)
+else:
+raise ValueError(f"Target invalide : {target}")
+
+# Analyse de la structure
+metadata = self._analyze_structure(local_path)
+
+logger.info(f"✅ Ingestion terminée : {local_path}")
+return local_path, metadata
+
+def _get_repo_name(self, target: str) -> str:
+"""Extrait le nom du dépôt."""
+if os.path.isdir(target):
+return os.path.basename(os.path.normpath(target))
+
+# URL GitHub : https://github.com/user/repo.git
+parts = target.rstrip('/').split('/')
+name = parts[-1]
+if name.endswith('.git'):
+name = name[:-4]
+return name or "unknown_repo"
+
+def _clone_repo(self, url: str, dest: str):
+"""Clone le dépôt."""
+try:
+cmd = ["git", "clone", "--depth", "1", url, dest]
+logger.info(f"Exécution : {' '.join(cmd)}")
+
+result = subprocess.run(
+cmd, capture_output=True, text=True, timeout=SentinelConfig.TIMEOUT
+)
+
+if result.returncode != 0:
+raise RuntimeError(f"Échec du clonage : {result.stderr}")
+
+logger.info("✅ Clonage réussi.")
+except FileNotFoundError:
+raise RuntimeError("Git n'est pas installé.")
+except subprocess.TimeoutExpired:
+raise RuntimeError(f"Timeout lors du clonage ({SentinelConfig.TIMEOUT}s)")
+
+def _analyze_structure(self, path: str) -> Dict[str, Any]:
+"""Analyse la structure du projet."""
+logger.info("🔍 Analyse de la structure...")
+
+stats = {
+"total_files": 0,
+"code_files": 0,
+"languages": {},
+"workflows": [],
+"total_size": 0,
+"has_dependencies": False,
+"dependency_files": []
+}
+
+for root, dirs, files in os.walk(path):
+# Ignorer les dossiers inutiles
+dirs[:] = [d for d in dirs if d not in [
+'.git', 'node_modules', 'venv', '__pycache__', 'dist', 'build',
+'.tox', 'target', 'vendor'
+]]
+
+for file in files:
+file_path = os.path.join(root, file)
+ext = os.path.splitext(file)[1].lower()
+
+stats["total_files"] += 1
+
+try:
+stats["total_size"] += os.path.getsize(file_path)
+except OSError:
+pass
+
+if ext in SentinelConfig.CODE_EXTENSIONS:
+stats["code_files"] += 1
+lang = SentinelConfig.CODE_EXTENSIONS[ext]
+stats["languages"][lang] = stats["languages"].get(lang, 0) + 1
+
+# Workflows GitHub Actions
+if ".github/workflows" in file_path and ext in ('.yml', '.yaml'):
+stats["workflows"].append(file_path)
+
+# Fichiers de dépendances
+if file in ['requirements.txt', 'package.json', 'Pipfile', 'poetry.lock',
+'Gemfile', 'go.mod', 'pom.xml', 'Cargo.toml']:
+stats["has_dependencies"] = True
+stats["dependency_files"].append(file_path)
+
+logger.info(f"📊 {stats['code_files']} fichiers de code détectés")
+logger.info(f"🔧 Langages : {list(stats['languages'].keys())}")
+logger.info(f"⚙️ {len(stats['workflows'])} workflows GitHub Actions")
+logger.info(f"📦 {len(stats['dependency_files'])} fichiers de dépendances")
+
+return stats
+
+# ==============================================================================
+# SECTION 7 : MODULE 2 — ANALYSE SAST
+# ==============================================================================
+
+class SastAnalyzer:
+"""Analyse statique multi-moteurs (Semgrep, Bandit)."""
+
+def __init__(self):
+self.findings: List[Finding] = []
+
+def analyze(self, repo_path: str, metadata: Dict[str, Any]) -> List[Finding]:
+"""Lance tous les analyseurs SAST."""
+logger.info("🔬 Lancement de l'analyse SAST...")
+
+self.findings = []
+
+# Lancer chaque moteur
+if self._is_tool_available("semgrep"):
+self._run_semgrep(repo_path)
+
+if "python" in metadata.get("languages", {}):
+if self._is_tool_available("bandit"):
+self._run_bandit(repo_path)
+
+# Analyse custom des secrets
+self._run_secret_scan(repo_path, metadata)
+
+logger.info(f"📊 SAST : {len(self.findings)} finding(s) détecté(s)")
+return self.findings
+
+def _is_tool_available(self, tool: str) -> bool:
+try:
+subprocess.run([tool, "--version"], capture_output=True, timeout=5)
+return True
+except (FileNotFoundError, subprocess.TimeoutExpired):
+logger.warning(f"Outil non disponible : {tool}")
+return False
+
+def _run_semgrep(self, repo_path: str):
+"""Lance Semgrep avec les règles de sécurité."""
+logger.info(" → Semgrep en cours...")
+
+try:
+cmd = [
+"semgrep", "scan",
+"--config=auto",
+"--json",
+"--quiet",
+"--timeout=30",
+repo_path
+]
+
+result = subprocess.run(
+cmd, capture_output=True, text=True, timeout=SentinelConfig.TIMEOUT
+)
+
+if result.stdout:
+data = json.loads(result.stdout)
+for issue in data.get("results", []):
+finding = Finding(
+id=f"SEMGREP-{issue.get('check_id', 'unknown')}",
+title=issue.get("check_id", "Semgrep Issue"),
+severity=self._map_semgrep_severity(issue.get("extra", {}).get("severity", "INFO")),
+category="SAST",
+file_path=issue.get("path", ""),
+line_number=issue.get("start", {}).get("line", 0),
+code_snippet=issue.get("extra", {}).get("lines", ""),
+description=issue.get("extra", {}).get("message", ""),
+reference=issue.get("extra", {}).get("metadata", {}).get("source", ""),
+source_tool="semgrep",
+remediation="Corriger selon les recommandations de la règle."
+)
+self.findings.append(finding)
+except subprocess.TimeoutExpired:
+logger.warning("Semgrep : timeout dépassé")
+except (json.JSONDecodeError, subprocess.CalledProcessError) as e:
+logger.debug(f"Semgrep erreur : {e}")
+
+def _map_semgrep_severity(self, severity: str) -> str:
+mapping = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
+return mapping.get(severity.upper(), "MEDIUM")
+
+def _run_bandit(self, repo_path: str):
+"""Lance Bandit sur le code Python."""
+logger.info(" → Bandit en cours...")
+
+try:
+cmd = [
+"bandit", "-r", repo_path,
+"-f", "json",
+"-ll"
+]
+
+result = subprocess.run(
+cmd, capture_output=True, text=True, timeout=SentinelConfig.TIMEOUT
+)
+
+if result.stdout:
+data = json.loads(result.stdout)
+for issue in data.get("results", []):
+finding = Finding(
+id=f"BANDIT-{issue.get('test_id', 'unknown')}",
+title=issue.get("test_name", "Bandit Issue"),
+severity=self._map_bandit_severity(issue.get("issue_severity", "LOW")),
+category="SAST",
+file_path=issue.get("filename", ""),
+line_number=issue.get("line_number", 0),
+code_snippet=issue.get("code", ""),
+description=issue.get("issue_text", ""),
+source_tool="bandit",
+remediation="Corriger selon les recommandations Bandit."
+)
+self.findings.append(finding)
+except subprocess.TimeoutExpired:
+logger.warning("Bandit : timeout")
+except (json.JSONDecodeError, subprocess.CalledProcessError) as e:
+logger.debug(f"Bandit erreur : {e}")
+
+def _map_bandit_severity(self, severity: str) -> str:
+mapping = {"HIGH": "HIGH", "MEDIUM": "MEDIUM", "LOW": "LOW"}
+return mapping.get(severity.upper(), "MEDIUM")
+
+def _run_secret_scan(self, repo_path: str, metadata: Dict[str, Any]):
+"""Scan des secrets basé sur les patterns."""
+logger.info(" → Scan des secrets...")
+
+count = 0
+
+for root, dirs, files in os.walk(repo_path):
+dirs[:] = [d for d in dirs if d not in [
+'.git', 'node_modules', 'venv', '__pycache__', 'dist', 'build'
+]]
+
+for file in files:
+file_path = os.path.join(root, file)
+ext = os.path.splitext(file)[1].lower()
+
+if ext not in SentinelConfig.CODE_EXTENSIONS:
+continue
+
+try:
+if os.path.getsize(file_path) > SentinelConfig.MAX_FILE_SIZE:
+continue
+
+with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+content = f.read()
+
+for secret_type, pattern in SentinelConfig.SECRET_PATTERNS.items():
+matches = re.finditer(pattern, content)
+for match in matches:
+line_num = content[:match.start()].count('\n') + 1
+
+finding = Finding(
+id=f"SECRET-{secret_type}-{hashlib.md5(match.group(0).encode()).hexdigest()[:8]}",
+title=f"Secret détecté : {secret_type}",
+severity="CRITICAL",
+category="SECRET",
+file_path=os.path.relpath(file_path, repo_path),
+line_number=line_num,
+code_snippet=match.group(0)[:100] + "...",
+description=f"Pattern de secret détecté : {secret_type}",
+source_tool="nexus-secret-scan",
+remediation="Supprimer le secret du code, utiliser des variables d'environnement, révoquer le secret."
+)
+self.findings.append(finding)
+count += 1
+except Exception as e:
+logger.debug(f"Erreur scan {file_path} : {e}")
+
+if count > 0:
+logger.warning(f"⚠️ {count} secret(s) potentiel(s) détecté(s)")
+
+# ==============================================================================
+# SECTION 8 : MODULE 3 — ANALYSE DES WORKFLOWS
+# ==============================================================================
+
+class WorkflowAnalyzer:
+"""Analyse les workflows GitHub Actions pour détecter les vulnérabilités."""
+
+DANGEROUS_PATTERNS = [
+{
+"id": "CMD_INJECTION",
+"pattern": r"\$\{\{\s*github\.event\.(issue|pull_request|comment)\.(title|body|head\.ref)",
+"severity": "CRITICAL",
+"description": "Injection de commandes via des données utilisateur dans un workflow"
+},
+{
+"id": "PR_TARGET",
+"pattern": r"pull_request_target",
+"severity": "HIGH",
+"description": "Utilisation de pull_request_target (risque de confused deputy)"
+},
+{
+"id": "PERMISSIONS_EXCESSIVE",
+"pattern": r"permissions:\s*write-all",
+"severity": "HIGH",
+"description": "Permissions excessives (write-all) dans un workflow"
+},
+{
+"id": "SECRETS_IN_RUN",
+"pattern": r"\$\{\{\s*secrets\.[^}]+\s*\}\}.*run:",
+"severity": "HIGH",
+"description": "Secrets utilisés directement dans une commande run"
+}
+]
+
+def __init__(self):
+self.findings: List[Finding] = []
+
+def analyze(self, repo_path: str, workflows: List[str]) -> List[Finding]:
+"""Analyse tous les workflows GitHub Actions."""
+logger.info(f"⚙️ Analyse de {len(workflows)} workflow(s)...")
+
+self.findings = []
+
+if not YAML_AVAILABLE:
+logger.warning("PyYAML non disponible, analyse des workflows désactivée.")
+return self.findings
+
+for workflow_path in workflows:
+self._analyze_workflow(repo_path, workflow_path)
+
+logger.info(f"📊 Workflows : {len(self.findings)} finding(s)")
+return self.findings
+
+def _analyze_workflow(self, repo_path: str, workflow_path: str):
+"""Analyse un workflow individuel."""
+try:
+with open(workflow_path, 'r', encoding='utf-8') as f:
+content = f.read()
+
+rel_path = os.path.relpath(workflow_path, repo_path)
+
+# Analyse par patterns
+for rule in self.DANGEROUS_PATTERNS:
+matches = re.finditer(rule["pattern"], content, re.MULTILINE)
+for match in matches:
+line_num = content[:match.start()].count('\n') + 1
+
+finding = Finding(
+id=f"WORKFLOW-{rule['id']}-{hashlib.md5(match.group(0).encode()).hexdigest()[:6]}",
+title=f"Workflow : {rule['id']}",
+severity=rule["severity"],
+category="WORKFLOW",
+file_path=rel_path,
+line_number=line_num,
+code_snippet=content[max(0, match.start()-50):min(len(content), match.end()+50)],
+description=rule["description"],
+source_tool="nexus-workflow-analyzer",
+remediation=self._get_remediation(rule["id"])
+)
+self.findings.append(finding)
+
+# Analyse structurelle
+try:
+workflow_data = yaml.safe_load(content)
+if isinstance(workflow_data, dict):
+self._analyze_structure(workflow_data, rel_path, content)
+except yaml.YAMLError:
+pass
+
+except Exception as e:
+logger.debug(f"Erreur analyse workflow {workflow_path} : {e}")
+
+def _analyze_structure(self, data: Dict, rel_path: str, content: str):
+"""Analyse la structure YAML du workflow."""
+# Vérifier les permissions
+if "permissions" not in data:
+finding = Finding(
+id="WORKFLOW-NO-PERMISSIONS",
+title="Permissions non définies",
+severity="MEDIUM",
+category="WORKFLOW",
+file_path=rel_path,
+line_number=1,
+code_snippet="",
+description="Le workflow n'a pas de section 'permissions'. Par défaut, GitHub accorde des permissions larges.",
+source_tool="nexus-workflow-analyzer",
+remediation="Ajouter une section 'permissions: read-all' ou des permissions granulaires."
+)
+self.findings.append(finding)
+
+def _get_remediation(self, rule_id: str) -> str:
+remediations = {
+"CMD_INJECTION": "Utiliser des variables d'environnement validées au lieu d'interpoler directement github.event dans run:.",
+"PR_TARGET": "Éviter pull_request_target. Si nécessaire, ne jamais checkout le code PR et ne pas exécuter de code non fiable.",
+"PERMISSIONS_EXCESSIVE": "Remplacer write-all par des permissions granulaires (contents: read, etc.).",
+"SECRETS_IN_RUN": "Utiliser env: pour passer les secrets aux commandes, avec validation."
+}
+return remediations.get(rule_id, "Corriger selon les bonnes pratiques GitHub Actions.")
+
+# ==============================================================================
+# SECTION 9 : MODULE 4 — ANALYSE DES DÉPENDANCES
+# ==============================================================================
+
+class DependencyAnalyzer:
+"""Analyse les dépendances pour détecter les vulnérabilités."""
+
+def __init__(self):
+self.findings: List[Finding] = []
+
+def analyze(self, repo_path: str, dep_files: List[str]) -> List[Finding]:
+"""Lance l'analyse des dépendances."""
+logger.info(f"📦 Analyse de {len(dep_files)} fichier(s) de dépendances...")
+
+self.findings = []
+
+if self._is_trivy_available():
+for dep_file in dep_files:
+self._run_trivy(repo_path, dep_file)
+else:
+logger.warning("Trivy non disponible, analyse des dépendances désactivée.")
+
+logger.info(f"📊 Dépendances : {len(self.findings)} finding(s)")
+return self.findings
+
+def _is_trivy_available(self) -> bool:
+try:
+subprocess.run(["trivy", "--version"], capture_output=True, timeout=5)
+return True
+except (FileNotFoundError, subprocess.TimeoutExpired):
+return False
+
+def _run_trivy(self, repo_path: str, dep_file: str):
+"""Lance Trivy sur un fichier de dépendances."""
+try:
+cmd = [
+"trivy", "fs",
+"--format", "json",
+"--quiet",
+"--scanners", "vuln",
+dep_file
+]
+
+result = subprocess.run(
+cmd, capture_output=True, text=True, timeout=SentinelConfig.TIMEOUT
+)
+
+if result.stdout:
+data = json.loads(result.stdout)
+
+for result_entry in data.get("Results", []):
+for vuln in result_entry.get("Vulnerabilities", []):
+finding = Finding(
+id=f"TRIVY-{vuln.get('VulnerabilityID', 'unknown')}",
+title=vuln.get("Title", vuln.get("VulnerabilityID", "Vulnérabilité")),
+severity=vuln.get("Severity", "UNKNOWN"),
+category="DEPENDENCY",
+file_path=os.path.relpath(dep_file, repo_path),
+line_number=0,
+code_snippet=f"{vuln.get('PkgName', '')}: {vuln.get('InstalledVersion', '')} -> {vuln.get('FixedVersion', 'N/A')}",
+description=vuln.get("Description", ""),
+cve=vuln.get("VulnerabilityID", ""),
+reference=vuln.get("PrimaryURL", ""),
+source_tool="trivy",
+remediation=f"Mettre à jour vers la version {vuln.get('FixedVersion', 'N/A')}"
+)
+self.findings.append(finding)
+
+except subprocess.TimeoutExpired:
+logger.warning(f"Trivy timeout sur {dep_file}")
+except (json.JSONDecodeError, subprocess.CalledProcessError) as e:
+logger.debug(f"Trivy erreur : {e}")
+
+# ==============================================================================
+# SECTION 10 : MODULE 5 — CROSS-CHECK ET DÉDUPLICATION
+# ==============================================================================
+
+class CrossChecker:
+"""Corrèle et déduplique les findings de tous les moteurs."""
+
+def deduplicate(self, findings: List[Finding]) -> List[Finding]:
+"""
+Déduplique les findings basés sur (fichier, ligne, catégorie).
+Priorise les findings avec la sévérité la plus haute.
+"""
+logger.info(f"🔄 Déduplication de {len(findings)} findings...")
+
+# Grouper par clé de déduplication
+groups: Dict[str, List[Finding]] = {}
+
+for finding in findings:
+key = f"{finding.file_path}:{finding.line_number}:{finding.category}"
+if key not in groups:
+groups[key] = []
+groups[key].append(finding)
+
+# Sélectionner le finding le plus sévère de chaque groupe
+severity_order = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1, "UNKNOWN": 0}
+
+deduplicated = []
+for key, group in groups.items():
+# Trier par sévérité décroissante
+group.sort(key=lambda f: severity_order.get(f.severity, 0), reverse=True)
+deduplicated.append(group[0])
+
+if len(group) > 1:
+logger.debug(f"Dédupliqué {len(group)} findings en 1 pour {key}")
+
+logger.info(f"✅ {len(findings)} → {len(deduplicated)} findings après déduplication")
+return deduplicated
+
+def prioritize(self, findings: List[Finding]) -> List[Finding]:
+"""
+Priorise les findings par sévérité, puis par catégorie.
+"""
+severity_order = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1, "UNKNOWN": 0}
+category_order = {"SECRET": 5, "WORKFLOW": 4, "SAST": 3, "DEPENDENCY": 2, "CONFIG": 1}
+
+return sorted(
+findings,
+key=lambda f: (
+-severity_order.get(f.severity, 0),
+-category_order.get(f.category, 0),
+f.file_path
+)
+)
+
+# ==============================================================================
+# SECTION 11 : MODULE 6 — GÉNÉRATION DE RAPPORT
+# ==============================================================================
+
+class ReportGenerator:
+"""Génère les rapports dans différents formats."""
+
+def __init__(self):
+pass
+
+def generate_json(self, report: AuditReport, output_path: str):
+"""Génère un rapport JSON."""
+with open(output_path, 'w', encoding='utf-8') as f:
+json.dump(report.to_dict(), f, indent=2, ensure_ascii=False)
+logger.info(f"📄 Rapport JSON : {output_path}")
+
+def generate_markdown(self, report: AuditReport, output_path: str):
+"""Génère un rapport Markdown structuré."""
+lines = []
+
+# En-tête
+lines.append(f"# 🛡️ Rapport d'Audit NEXUS-SENTINEL\n")
+lines.append(f"**Cible :** `{report.target}`\n")
+lines.append(f"**Date :** {report.timestamp}\n")
+lines.append(f"**Durée :** {report.duration:.2f}s\n")
+lines.append(f"**Fichiers analysés :** {report.files_analyzed}\n")
+lines.append(f"**Total findings :** {len(report.findings)}\n")
+lines.append("\n---\n")
+
+# Statistiques
+lines.append("## 📊 Statistiques\n")
+lines.append("| Sévérité | Nombre |")
+lines.append("|----------|--------|")
+for severity in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
+count = report.stats.get(severity, 0)
+if count > 0:
+lines.append(f"| {severity} | {count} |")
+lines.append("\n---\n")
+
+# Findings par catégorie
+lines.append("## 🔍 Findings\n")
+
+categories: Dict[str, List[Finding]] = {}
+for finding in report.findings:
+if finding.category not in categories:
+categories[finding.category] = []
+categories[finding.category].append(finding)
+
+for category, findings in categories.items():
+lines.append(f"### 📁 {category} ({len(findings)})\n")
+
+for finding in findings:
+emoji = self._severity_emoji(finding.severity)
+lines.append(f"#### {emoji} [{finding.severity}] {finding.title}\n")
+lines.append(f"- **Fichier :** `{finding.file_path}:{finding.line_number}`\n")
+lines.append(f"- **Outil :** {finding.source_tool}\n")
+if finding.cve:
+lines.append(f"- **CVE :** {finding.cve}\n")
+lines.append(f"- **Description :** {finding.description}\n")
+if finding.code_snippet:
+lines.append(f"\n```\n{finding.code_snippet[:500]}\n```\n")
+if finding.remediation:
+lines.append(f"- **🔧 Remédiation :** {finding.remediation}\n")
+if finding.reference:
+lines.append(f"- **📖 Référence :** {finding.reference}\n")
+lines.append("\n")
+
+# Erreurs
+if report.errors:
+lines.append("## ⚠️ Erreurs d'analyse\n")
+for error in report.errors:
+lines.append(f"- {error}\n")
+
+lines.append("\n---\n")
+lines.append(f"*Rapport généré par NEXUS-SENTINEL v{SentinelConfig.VERSION}*\n")
+lines.append(f"*Architecte : {SentinelConfig.ARCHITECTE}*\n")
+
+with open(output_path, 'w', encoding='utf-8') as f:
+f.writelines(lines)
+
+logger.info(f"📄 Rapport Markdown : {output_path}")
+
+def generate_html(self, report: AuditReport, output_path: str):
+"""Génère un rapport HTML stylisé."""
+html = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>NEXUS-SENTINEL Audit Report</title>
+<style>
+body {{ font-family: -apple-system, sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; }}
+h1 {{ color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 10px; }}
+h2 {{ color: #79c0ff; margin-top: 30px; }}
+h3 {{ color: #d2a8ff; }}
+.finding {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 15px; margin: 15px 0; }}
+.critical {{ border-left: 4px solid #f85149; }}
+.high {{ border-left: 4px solid #ff7b72; }}
+.medium {{ border-left: 4px solid #d29922; }}
+.low {{ border-left: 4px solid #58a6ff; }}
+.info {{ border-left: 4px solid #8b949e; }}
+pre {{ background: #0d1117; border: 1px solid #30363d; padding: 10px; border-radius: 4px; overflow-x: auto; }}
+table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
+th, td {{ border: 1px solid #30363d; padding: 8px; text-align: left; }}
+th {{ background: #161b22; }}
+</style>
+</head>
+<body>
+<h1>🛡️ NEXUS-SENTINEL Audit Report</h1>
+<p><strong>Cible :</strong> {report.target}</p>
+<p><strong>Date :</strong> {report.timestamp}</p>
+<p><strong>Durée :</strong> {report.duration:.2f}s</p>
+<p><strong>Findings :</strong> {len(report.findings)}</p>
+
+<h2>📊 Statistiques</h2>
+<table>
+<tr><th>Sévérité</th><th>Nombre</th></tr>
+"""
+for severity in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
+count = report.stats.get(severity, 0)
+if count > 0:
+html += f"<tr><td>{severity}</td><td>{count}</td></tr>\n"
+
+html += "</table><h2>🔍 Findings</h2>\n"
+
+for finding in report.findings:
+severity_class = finding.severity.lower()
+html += f"""
+<div class="finding {severity_class}">
+<h3>{self._severity_emoji(finding.severity)} [{finding.severity}] {finding.title}</h3>
+<p><strong>Fichier :</strong> <code>{finding.file_path}:{finding.line_number}</code></p>
+<p><strong>Outil :</strong> {finding.source_tool}</p>
+<p><strong>Description :</strong> {finding.description}</p>
+"""
+if finding.code_snippet:
+html += f"<pre>{finding.code_snippet[:500]}</pre>"
+if finding.remediation:
+html += f"<p><strong>🔧 Remédiation :</strong> {finding.remediation}</p>"
+html += "</div>\n"
+
+html += f"""
+<hr>
+<p><em>Rapport généré par NEXUS-SENTINEL v{SentinelConfig.VERSION}</em></p>
+<p><em>Architecte : {SentinelConfig.ARCHITECTE}</em></p>
+</body>
+</html>"""
+
+with open(output_path, 'w', encoding='utf-8') as f:
+f.write(html)
+
+logger.info(f"📄 Rapport HTML : {output_path}")
+
+def _severity_emoji(self, severity: str) -> str:
+emojis = {
+"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡",
+"LOW": "🔵", "INFO": "⚪", "UNKNOWN": "⚫"
+}
+return emojis.get(severity.upper(), "⚫")
+
+# ==============================================================================
+# SECTION 12 : ORCHESTRATEUR PRINCIPAL
+# ==============================================================================
+
+class SentinelOrchestrator:
+"""Orchestrateur principal de l'audit."""
+
+def __init__(self):
+self.ingestor = Ingestor()
+self.sast = SastAnalyzer()
+self.workflow = WorkflowAnalyzer()
+self.deps = DependencyAnalyzer()
+self.crosschecker = CrossChecker()
+self.report_gen = ReportGenerator()
+self.db = SentinelDatabase()
+
+def audit(self, target: str, output_format: str = "all") -> AuditReport:
+"""Lance un audit complet."""
+start_time = time.time()
+
+print("\n" + "=" * 70)
+print(f"🛡️ NEXUS-SENTINEL AUDIT v{SentinelConfig.VERSION}")
+print(f"🎯 Cible : {target}")
+print("=" * 70 + "\n")
+
+findings: List[Finding] = []
+errors: List[str] = []
+
+try:
+# Phase 1 : Ingestion
+repo_path, metadata = self.ingestor.ingest(target)
+
+# Phase 2 : Analyse SAST
+findings.extend(self.sast.analyze(repo_path, metadata))
+
+# Phase 3 : Analyse des workflows
+if metadata.get("workflows"):
+findings.extend(self.workflow.analyze(repo_path, metadata["workflows"]))
+
+# Phase 4 : Analyse des dépendances
+if metadata.get("dependency_files"):
+findings.extend(self.deps.analyze(repo_path, metadata["dependency_files"]))
+
+# Phase 5 : Cross-check et déduplication
+findings = self.crosschecker.deduplicate(findings)
+findings = self.crosschecker.prioritize(findings)
+
+except Exception as e:
+errors.append(f"Erreur critique : {str(e)}")
+logger.error(traceback.format_exc())
+
+# Calcul de la durée
+duration = time.time() - start_time
+
+# Statistiques
+stats: Dict[str, int] = {}
+for finding in findings:
+stats[finding.severity] = stats.get(finding.severity, 0) + 1
+
+# Construction du rapport
+report = AuditReport(
+target=target,
+timestamp=datetime.now().isoformat(),
+duration=duration,
+files_analyzed=metadata.get("code_files", 0) if 'metadata' in locals() else 0,
+findings=findings,
+stats=stats,
+errors=errors
+)
+
+# Sauvegarde en DB
+try:
+audit_id = self.db.save_audit(report)
+
+# Comparaison avec l'audit précédent
+previous = self.db.get_previous_audit(target)
+if previous:
+self._compare_with_previous(report, previous)
+except Exception as e:
+logger.error(f"Erreur DB : {e}")
+
+# Génération des rapports
+timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+base_name = f"sentinel_report_{timestamp_str}"
+
+if output_format in ["all", "json"]:
+self.report_gen.generate_json(report, os.path.join(SentinelConfig.WORKSPACE_DIR, f"{base_name}.json"))
+
+if output_format in ["all", "md"]:
+self.report_gen.generate_markdown(report, os.path.join(SentinelConfig.WORKSPACE_DIR, f"{base_name}.md"))
+
+if output_format in ["all", "html"]:
+self.report_gen.generate_html(report, os.path.join(SentinelConfig.WORKSPACE_DIR, f"{base_name}.html"))
+
+# Affichage final
+self._display_summary(report)
+
+return report
+
+def _compare_with_previous(self, current: AuditReport, previous: Dict):
+"""Compare avec l'audit précédent pour détecter les régressions."""
+previous_findings = {f["id"] for f in previous.get("findings", [])}
+current_findings = {f.id for f in current.findings}
+
+new_findings = current_findings - previous_findings
+fixed_findings = previous_findings - current_findings
+
+if new_findings:
+logger.warning(f"⚠️ {len(new_findings)} nouvelle(s) régression(s) détectée(s)")
+if fixed_findings:
+logger.info(f"✅ {len(fixed_findings)} finding(s) corrigé(s)")
+
+def _display_summary(self, report: AuditReport):
+"""Affiche un résumé du rapport."""
+print("\n" + "=" * 70)
+print("📊 RÉSUMÉ DE L'AUDIT")
+print("=" * 70)
+print(f"🎯 Cible : {report.target}")
+print(f"⏱️ Durée : {report.duration:.2f}s")
+print(f"📁 Fichiers analysés : {report.files_analyzed}")
+print(f"🔍 Total findings : {len(report.findings)}")
+print()
+
+if RICH_AVAILABLE and console:
+table = Table(title="Findings par sévérité")
+table.add_column("Sévérité", style="bold")
+table.add_column("Nombre", justify="right")
+
+for severity in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
+count = report.stats.get(severity, 0)
+if count > 0:
+table.add_row(severity, str(count))
+
+console.print(table)
+else:
+print("Findings par sévérité :")
+for severity in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
+count = report.stats.get(severity, 0)
+if count > 0:
+print(f" {severity}: {count}")
+
+if report.errors:
+print("\n⚠️ Erreurs :")
+for error in report.errors:
+print(f" - {error}")
+
+print("\n" + "=" * 70)
+
+# ==============================================================================
+# SECTION 13 : CLI (Interface en ligne de commande)
+# ==============================================================================
+
+def main():
+parser = argparse.ArgumentParser(
+description=f"NEXUS-SENTINEL v{SentinelConfig.VERSION} — Audit de sécurité souverain",
+formatter_class=argparse.RawDescriptionHelpFormatter,
+epilog="""
+Exemples :
+python nexus_sentinel.py audit https://github.com/user/repo
+python nexus_sentinel.py audit ./mon-projet --format md
+python nexus_sentinel.py scan ./mon-projet --sast-only
+python nexus_sentinel.py history --target https://github.com/user/repo
+"""
+)
+
+subparsers = parser.add_subparsers(dest="command", help="Commande à exécuter")
+
+# Commande : audit complet
+audit_parser = subparsers.add_parser("audit", help="Audit complet d'un dépôt")
+audit_parser.add_argument("target", help="URL ou chemin du dépôt")
+audit_parser.add_argument("--format", choices=["all", "json", "md", "html"], default="all",
+help="Format de sortie (défaut: all)")
+
+# Commande : scan rapide
+scan_parser = subparsers.add_parser("scan", help="Scan rapide (SAST uniquement)")
+scan_parser.add_argument("target", help="URL ou chemin du dépôt")
+scan_parser.add_argument("--sast-only", action="store_true", help="SAST uniquement")
+
+# Commande : historique
+history_parser = subparsers.add_parser("history", help="Historique des audits")
+history_parser.add_argument("--target", help="Filtrer par cible")
+
+# Commande : setup
+subparsers.add_parser("setup", help="Installer les dépendances")
+
+args = parser.parse_args()
+
+if not args.command:
+parser.print_help()
+return
+
+# Installation des dépendances
+install_system_dependencies()
+install_python_dependencies()
+
+# Orchestrateur
+orchestrator = SentinelOrchestrator()
+
+if args.command == "audit":
+orchestrator.audit(args.target, args.format)
+
+elif args.command == "scan":
+# Scan rapide
+logger.info("Scan rapide...")
+repo_path, metadata = orchestrator.ingestor.ingest(args.target)
+findings = orchestrator.sast.analyze(repo_path, metadata)
+
+print(f"\n📊 {len(findings)} finding(s) détecté(s)")
+for finding in findings[:10]: # Top 10
+print(f" [{finding.severity}] {finding.title} - {finding.file_path}:{finding.line_number}")
+
+elif args.command == "history":
+# Historique
+if args.target:
+prev = orchestrator.db.get_previous_audit(args.target)
+if prev:
+print(f"Dernier audit : {prev.get('timestamp')}")
+print(f"Findings : {len(prev.get('findings', []))}")
+else:
+print("Aucun audit trouvé.")
+else:
+print("Spécifiez --target pour l'historique.")
+
+elif args.command == "setup":
+print("✅ Dépendances vérifiées et installées.")
+
+if __name__ == "__main__":
+try:
+main()
+except KeyboardInterrupt:
+logger.info("\nArrêt demandé.")
+sys.exit(0)
+except Exception as e:
+logger.error(f"Erreur fatale : {e}")
+logger.debug(traceback.format_exc())
+sys.exit(1)
