@@ -1,0 +1,16 @@
+    binaries = {
+        "semgrep": ["semgrep", "--version"],
+        "trivy": ["trivy", "--version"],
+        "gitleaks": ["gitleaks", "version"],
+        "bandit": ["bandit", "--version"],
+        "spotbugs": ["spotbugs", "-version"],
+        "pmd": ["pmd", "-version"],
+        "cppcheck": ["cppcheck", "--version"],         # <-- AJOUT
+        "clang-tidy": ["clang-tidy", "--version"],     # <-- AJOUT
+    }
+
+    # ... après le code existant ...
+    if "cppcheck" in missing:
+        logger.warning("Cppcheck non installé. Installer via : sudo apt install cppcheck")
+    if "clang-tidy" in missing:
+        logger.warning("Clang-Tidy non installé. Installer via : sudo apt install clang-tidy")
