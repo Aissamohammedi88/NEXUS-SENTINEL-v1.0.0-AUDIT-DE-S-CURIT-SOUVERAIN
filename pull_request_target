@@ -1,0 +1,12 @@
+{
+    "id": "PR_TARGET_UNSAFE",
+    "pattern": r"pull_request_target[\s\S]{0,500}?actions/checkout[\s\S]{0,200}?(ref:\s*\$\{\{\s*github\.event\.pull_request\.head)",
+    "severity": "CRITICAL",
+    "description": "pull_request_target + checkout de la branche PR = exécution de code non fiable avec accès aux secrets"
+},
+{
+    "id": "PR_TARGET",
+    "pattern": r"on:\s*\n\s+pull_request_target",
+    "severity": "MEDIUM",
+    "description": "Utilisation de pull_request_target (à auditer manuellement)"
+}
