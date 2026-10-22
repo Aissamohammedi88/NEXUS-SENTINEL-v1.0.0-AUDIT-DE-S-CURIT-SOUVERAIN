@@ -1,0 +1,4 @@
+    # --- Configuration Java ---
+    JAVA_EXTENSIONS = {'.java'}
+    SPOTBUGS_CMD = "spotbugs"
+    PMD_CMD = "pmd"
