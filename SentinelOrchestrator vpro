@@ -1,0 +1,28 @@
+class SentinelOrchestrator:
+    def __init__(self):
+        self.ingestor = Ingestor()
+        self.sast = SastAnalyzer()
+        self.workflow = WorkflowAnalyzer()
+        self.deps = DependencyAnalyzer()
+        self.java = JavaAnalyzer()        # <-- AJOUT
+        self.cpp = CppAnalyzer()          # <-- AJOUT
+        self.crosschecker = CrossChecker()
+        self.report_gen = ReportGenerator()
+        self.db = SentinelDatabase()
+
+    def audit(self, target: str, output_format: str = "all") -> AuditReport:
+        # ... début inchangé ...
+
+        try:
+            repo_path, metadata = self.ingestor.ingest(target)
+            findings.extend(self.sast.analyze(repo_path, metadata))
+            findings.extend(self.java.analyze(repo_path, metadata))    # <-- AJOUT
+            findings.extend(self.cpp.analyze(repo_path, metadata))     # <-- AJOUT
+
+            if metadata.get("workflows"):
+                findings.extend(self.workflow.analyze(repo_path, metadata["workflows"]))
+
+            if metadata.get("dependency_files"):
+                findings.extend(self.deps.analyze(repo_path, metadata["dependency_files"]))
+
+            # ... reste inchangé ...
