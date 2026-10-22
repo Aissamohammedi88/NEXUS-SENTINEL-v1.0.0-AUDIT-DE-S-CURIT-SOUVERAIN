@@ -1,0 +1,20 @@
+def install_system_dependencies():
+    """Installe les dépendances système."""
+    logger.info("Vérification des dépendances système...")
+
+    binaries = {
+        "semgrep": ["semgrep", "--version"],
+        "trivy": ["trivy", "--version"],
+        "gitleaks": ["gitleaks", "version"],
+        "bandit": ["bandit", "--version"],
+        "spotbugs": ["spotbugs", "-version"],  # <-- AJOUT
+        "pmd": ["pmd", "-version"],            # <-- AJOUT
+    }
+
+    # ... code existant pour pip ...
+
+    # Instructions manuelles pour les outils système
+    if "spotbugs" in missing:
+        logger.warning("SpotBugs non installé. Installer via : sudo apt install spotbugs")
+    if "pmd" in missing:
+        logger.warning("PMD non installé. Installer via : sudo apt install pmd")
