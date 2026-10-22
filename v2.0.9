@@ -1,0 +1,1773 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+# ═══════════════════════════════════════════════════════════════════════════
+# NEXUS SENTINEL v2.0.1 — Audit souverain · local · temps réel
+# ─────────────────────────────────────────────────────────────────────────
+# Auteur : Aissa Mohammedi (DGK)
+# Licence : NEXUS-OPEN-3.0
+# Port : 9992
+# ─────────────────────────────────────────────────────────────────────────
+# Corrections v2.0.1 :
+# - Fix regex SQL_STRING (guillemets non échappés)
+# - Regex précompilés au chargement (perf)
+# - import socket en haut
+# - SSE robuste (ping tolérant)
+# - extract_high_entropy_tokens limité (pas de scan binaire)
+# - to_sarif : line_number >= 1 garanti
+# - HTML : __V__ remplacé partout proprement
+# - risk_level 'NONE' si aucun finding
+# - Copie local robuste (ignore errors)
+# ═══════════════════════════════════════════════════════════════════════════
+
+import sys
+import os
+import re
+import json
+import math
+import time
+import uuid
+import queue
+import shutil
+import socket
+import sqlite3
+import hashlib
+import logging
+import argparse
+import threading
+import subprocess
+import traceback
+import urllib.parse
+from pathlib import Path
+from datetime import datetime
+from dataclasses import dataclass, field, asdict
+from logging.handlers import RotatingFileHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 1 · CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+VERSION = "2.0.1"
+AUTEUR = "Aissa Mohammedi (DGK)"
+LICENCE = "NEXUS-OPEN-3.0"
+HOST = "127.0.0.1"
+PORT = 9992
+
+HOME = Path(os.path.expanduser("~"))
+BASES = [
+HOME / "Documents" / "nexus_sentinel",
+HOME / "nexus_sentinel",
+Path("/tmp/nexus_sentinel"),
+Path.cwd() / "nexus_sentinel",
+]
+BASE = None
+for _b in BASES:
+try:
+_b.mkdir(parents=True, exist_ok=True)
+_t = _b / ".wt"
+_t.write_text("ok")
+_t.unlink()
+BASE = _b
+break
+except Exception:
+continue
+if BASE is None:
+BASE = Path.cwd()
+
+WORKSPACE = BASE / "workspace"
+LOG_DIR = BASE / "logs"
+DB_FILE = BASE / "sentinel.db"
+WORKSPACE.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+MAX_FILE_SIZE = 5 * 1024 * 1024
+SCAN_TIMEOUT = 300
+SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__",
+"dist", "build", ".next", "target", ".pytest_cache", "vendor"}
+
+CODE_EXT = {
+".py": "python", ".js": "javascript", ".ts": "typescript",
+".jsx": "javascript", ".tsx": "typescript",
+".java": "java", ".go": "go", ".rb": "ruby", ".php": "php",
+".c": "c", ".h": "c", ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp",
+".cs": "csharp", ".rs": "rust", ".swift": "swift", ".kt": "kotlin",
+".sh": "bash", ".yml": "yaml", ".yaml": "yaml",
+".json": "json", ".sql": "sql", ".env": "env",
+}
+
+DEP_FILES = {
+"requirements.txt", "Pipfile", "pyproject.toml",
+"package.json", "yarn.lock", "package-lock.json",
+"Gemfile", "Gemfile.lock", "go.mod", "go.sum",
+"pom.xml", "build.gradle", "Cargo.toml", "Cargo.lock",
+"composer.json", "composer.lock",
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 2 · LOGGING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _setup_logging():
+logger = logging.getLogger("NEXUS_SENTINEL")
+logger.setLevel(logging.DEBUG)
+if logger.handlers:
+return logger
+fmt = logging.Formatter(
+"%(asctime)s | %(levelname)-7s | %(message)s",
+datefmt="%H:%M:%S",
+)
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.INFO)
+ch.setFormatter(fmt)
+logger.addHandler(ch)
+fh = RotatingFileHandler(
+str(LOG_DIR / "sentinel.log"),
+maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8",
+)
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(fmt)
+logger.addHandler(fh)
+return logger
+
+
+logger = _setup_logging()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 3 · PATTERNS DE DÉTECTION (précompilés)
+# ═══════════════════════════════════════════════════════════════════════════
+
+SECRET_PATTERNS = {
+"AWS_ACCESS_KEY": (re.compile(r"AKIA[0-9A-Z]{16}"), "CRITICAL"),
+"AWS_SECRET_KEY": (re.compile(r"aws_secret_access_key\s*[=:]\s*['\"]?([A-Za-z0-9/+=]{40})"), "CRITICAL"),
+"GITHUB_TOKEN": (re.compile(r"gh[pousr]_[A-Za-z0-9_]{36,}"), "CRITICAL"),
+"GITLAB_TOKEN": (re.compile(r"glpat-[A-Za-z0-9_\-]{20,}"), "CRITICAL"),
+"SLACK_TOKEN": (re.compile(r"xox[baprs]-[0-9A-Za-z\-]{10,}"), "HIGH"),
+"PRIVATE_KEY": (re.compile(r"-----BEGIN (RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----"), "CRITICAL"),
+"GOOGLE_API_KEY": (re.compile(r"AIza[0-9A-Za-z_\-]{35}"), "HIGH"),
+"STRIPE_LIVE": (re.compile(r"sk_live_[0-9a-zA-Z]{24,}"), "CRITICAL"),
+"STRIPE_TEST": (re.compile(r"sk_test_[0-9a-zA-Z]{24,}"), "MEDIUM"),
+"SENDGRID": (re.compile(r"SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}"), "HIGH"),
+"TWILIO": (re.compile(r"SK[0-9a-f]{32}"), "HIGH"),
+"MAILGUN": (re.compile(r"key-[0-9a-zA-Z]{32}"), "HIGH"),
+"JWT": (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "MEDIUM"),
+"BEARER": (re.compile(r"[Bb]earer\s+[A-Za-z0-9_\-\.]{20,}"), "MEDIUM"),
+"PASSWORD_LITERAL": (re.compile(r"(?i)(password|passwd|pwd)\s*[=:]\s*['\"][^'\"]{8,}['\"]"), "HIGH"),
+"DB_CONN": (re.compile(r"(?:postgres|mysql|mongodb|redis)(?:ql)?://[^\s'\"]+"), "HIGH"),
+"PRIVATE_IP": (re.compile(r"\b(?:10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b"), "LOW"),
+"OPENAI_KEY": (re.compile(r"sk-[A-Za-z0-9]{20,}"), "CRITICAL"),
+"ANTHROPIC_KEY": (re.compile(r"sk-ant-[A-Za-z0-9_\-]{40,}"), "CRITICAL"),
+"HUGGINGFACE": (re.compile(r"hf_[A-Za-z0-9]{30,}"), "HIGH"),
+"NPM_TOKEN": (re.compile(r"npm_[A-Za-z0-9]{36}"), "HIGH"),
+"PYPI_TOKEN": (re.compile(r"pypi-[A-Za-z0-9_\-]{50,}"), "HIGH"),
+"DOCKER_CONFIG": (re.compile(r'"auths"\s*:\s*\{'), "LOW"),
+"SSH_KEY_WEAK": (re.compile(r"ssh-(rsa|dss)\s+AAAA"), "LOW"),
+}
+
+CODE_ANTIPATTERNS = {
+"EVAL_USAGE": (re.compile(r"\beval\s*\("), "HIGH", "Exécution de code dynamique via eval()"),
+"EXEC_USAGE": (re.compile(r"\bexec\s*\("), "MEDIUM", "Exécution de commandes via exec()"),
+"OS_SYSTEM": (re.compile(r"\bos\.system\s*\("), "HIGH", "Shell injection possible via os.system()"),
+"SUBPROCESS_SHELL": (re.compile(r"subprocess\.(?:run|call|Popen)[^)]*shell\s*=\s*True"), "HIGH", "Shell=True ouvre l'injection"),
+"PICKLE_LOAD": (re.compile(r"pickle\.loads?\s*\("), "HIGH", "Désérialisation non sûre"),
+"YAML_UNSAFE": (re.compile(r"yaml\.load\s*\([^,)]*\)"), "MEDIUM", "yaml.load sans Loader=SafeLoader"),
+# CORRECTION : la regex originale avait des guillemets mal fermés
+"SQL_STRING": (re.compile(r"""(?:execute|query)\s*\(\s*['"][^'"]*%\s*\("""), "HIGH", "SQL construite par concaténation"),
+"MD5_HASH": (re.compile(r"hashlib\.md5\s*\("), "MEDIUM", "MD5 cryptographiquement cassé"),
+"SHA1_HASH": (re.compile(r"hashlib\.sha1\s*\("), "MEDIUM", "SHA-1 cryptographiquement faible"),
+"RANDOM_SECRET": (re.compile(r"random\.(random|randint|choice)\s*\("), "MEDIUM", "random non cryptographique (utiliser secrets)"),
+"DEBUG_TRUE": (re.compile(r"debug\s*[=:]\s*[Tt]rue"), "MEDIUM", "Debug activé en production ?"),
+"VERIFY_FALSE": (re.compile(r"verify\s*=\s*False"), "HIGH", "SSL verification désactivée"),
+"CORS_ALL": (re.compile(r"Access-Control-Allow-Origin['\"]?\s*[:=]\s*['\"]\*"), "MEDIUM", "CORS ouvert à tous"),
+"HARDCODED_TOKEN": (re.compile(r"(?i)(api[_-]?key|token|secret)\s*[:=]\s*['\"][A-Za-z0-9+/=_\-]{16,}['\"]"), "HIGH", "Token en dur dans le code"),
+"TODO_SECURITY": (re.compile(r"(?i)#\s*(TODO|FIXME|XXX).{0,40}(security|auth|password|unsafe)"), "LOW", "TODO/FIXME lié à la sécurité"),
+"TLS_OLD": (re.compile(r"(?:TLSv1(?!_2)|SSLv[23]|PROTOCOL_SSLv)"), "HIGH", "TLS/SSL obsolète"),
+"HTML_UNESCAPED": (re.compile(r"innerHTML\s*=\s*[^;'\"`]+\+"), "MEDIUM", "innerHTML avec concaténation (XSS)"),
+"DANGEROUS_HTML": (re.compile(r"dangerouslySetInnerHTML"), "MEDIUM", "React dangerouslySetInnerHTML"),
+}
+
+WORKFLOW_PATTERNS = {
+"CMD_INJECTION": (re.compile(r"\$\{\{\s*github\.event\.(?:issue|pull_request|comment)\.[a-z_.]+\s*\}\}"), "CRITICAL", "Injection de commandes via github.event.*"),
+"PR_TARGET": (re.compile(r"pull_request_target"), "HIGH", "pull_request_target ouvre les secrets aux PRs"),
+"WRITE_ALL": (re.compile(r"permissions\s*:\s*write-all"), "HIGH", "permissions: write-all trop large"),
+"UNPINNED_ACTION": (re.compile(r"uses\s*:\s*[a-zA-Z0-9_\-\.]+@(?:main|master|v\d+)\b"), "MEDIUM", "Action GitHub non pinée au SHA"),
+"SECRET_IN_ECHO": (re.compile(r"echo\s+.*\$\{\{\s*secrets\."), "HIGH", "Secret loggé via echo"),
+"SELF_HOSTED": (re.compile(r"runs-on\s*:\s*self-hosted"), "MEDIUM", "Runner self-hosted (risque si public)"),
+"CACHE_POISONING": (re.compile(r"actions/cache@"), "LOW", "Attention au cache poisoning"),
+"SCRIPT_INJECTION": (re.compile(r"run\s*:\s*\|[\s\S]*?\$\{\{\s*github\.event"), "CRITICAL", "run: avec interpolation d'event"),
+}
+
+LICENSE_BAD = {
+"GPL-3.0": "Copyleft fort — implications pour usage commercial",
+"AGPL-3.0": "Copyleft réseau — implications SaaS",
+"SSPL": "Non-OSI — restrictions cloud",
+"BUSL": "Business Source — restrictions commerciales",
+"CC-BY-NC": "Non commercial",
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 4 · STRUCTURES DE DONNÉES
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Finding:
+id: str
+title: str
+severity: str
+category: str
+file_path: str = ""
+line_number: int = 0
+code_snippet: str = ""
+description: str = ""
+remediation: str = ""
+reference: str = ""
+cve: str = ""
+source_tool: str = "nexus"
+timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+def to_dict(self):
+return asdict(self)
+
+
+@dataclass
+class AuditReport:
+id: str
+target: str
+started_at: str
+finished_at: str = ""
+duration_s: float = 0.0
+files_scanned: int = 0
+findings: list = field(default_factory=list)
+stats: dict = field(default_factory=dict)
+risk_score: float = 0.0
+risk_level: str = ""
+errors: list = field(default_factory=list)
+status: str = "running"
+metadata: dict = field(default_factory=dict)
+
+def to_dict(self):
+return {
+"id": self.id,
+"target": self.target,
+"started_at": self.started_at,
+"finished_at": self.finished_at,
+"duration_s": round(self.duration_s, 2),
+"files_scanned": self.files_scanned,
+"findings": [f.to_dict() if isinstance(f, Finding) else f
+for f in self.findings],
+"stats": self.stats,
+"risk_score": round(self.risk_score, 2),
+"risk_level": self.risk_level,
+"errors": self.errors,
+"status": self.status,
+"metadata": self.metadata,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 5 · DÉTECTION PAR ENTROPIE (Shannon)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def shannon_entropy(s):
+if not s:
+return 0.0
+counts = {}
+for c in s:
+counts[c] = counts.get(c, 0) + 1
+n = len(s)
+h = 0.0
+for c, cnt in counts.items():
+p = cnt / n
+h -= p * math.log2(p)
+return h
+
+
+def looks_like_secret_entropy(token, min_len=20, threshold=4.2):
+if len(token) < min_len:
+return False
+if token.isdigit():
+return False
+if token.isalpha() and (token.islower() or token.isupper()):
+return False
+if re.fullmatch(r"[A-Z_]+", token):
+return False
+if re.fullmatch(r"[a-z_]+", token):
+return False
+return shannon_entropy(token) >= threshold
+
+
+def extract_high_entropy_tokens(content, min_len=20, max_tokens=5):
+"""Extrait les tokens à haute entropie qui ressemblent à des secrets."""
+# CORRECTION : limiter la taille scannée pour éviter les explosions sur binaire
+if len(content) > 500_000:
+content = content[:500_000]
+tokens = re.findall(r"[A-Za-z0-9+/=_\-]{%d,}" % min_len, content)
+hits = []
+seen = set()
+for tok in tokens:
+if tok in seen:
+continue
+seen.add(tok)
+if looks_like_secret_entropy(tok):
+hits.append(tok)
+if len(hits) >= max_tokens:
+break
+return hits
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 6 · MOTEURS D'ANALYSE
+# ═══════════════════════════════════════════════════════════════════════════
+
+class EngineBase:
+name = "base"
+
+def scan_file(self, rel_path, abs_path, content):
+return []
+
+def scan_meta(self, repo_path, metadata):
+return []
+
+def available(self):
+return True
+
+
+class SecretsEngine(EngineBase):
+name = "secrets"
+
+def scan_file(self, rel_path, abs_path, content):
+findings = []
+lines = content.splitlines()
+for pid, (pat, sev) in SECRET_PATTERNS.items():
+for i, line in enumerate(lines, 1):
+m = pat.search(line)
+if m:
+masked = m.group(0)
+if len(masked) > 12:
+masked = masked[:6] + "..." + masked[-4:]
+findings.append(Finding(
+id="SEC-" + pid,
+title="Secret possible : " + pid,
+severity=sev,
+category="SECRETS",
+file_path=rel_path,
+line_number=i,
+code_snippet=masked,
+description="Pattern {} détecté.".format(pid),
+remediation="Retirer du code source, révoquer le secret, utiliser un vault.",
+source_tool="nexus.secrets",
+))
+for tok in extract_high_entropy_tokens(content):
+if any(pat.search(tok) for pat, _ in SECRET_PATTERNS.values()):
+continue
+idx = content.find(tok)
+if idx < 0:
+continue
+line_no = content[:idx].count("\n") + 1
+masked = tok[:6] + "..." + tok[-4:] if len(tok) > 12 else tok
+findings.append(Finding(
+id="SEC-ENTROPY",
+title="Token à haute entropie (secret potentiel)",
+severity="MEDIUM",
+category="SECRETS",
+file_path=rel_path,
+line_number=line_no,
+code_snippet=masked,
+description="Entropie de Shannon {:.2f} bits/char — ressemble à un secret.".format(
+shannon_entropy(tok)),
+remediation="Vérifier manuellement. Si c'est un secret, révoquer.",
+source_tool="nexus.entropy",
+))
+return findings
+
+
+class CodeEngine(EngineBase):
+name = "code"
+
+def scan_file(self, rel_path, abs_path, content):
+findings = []
+lines = content.splitlines()
+for pid, (pat, sev, desc) in CODE_ANTIPATTERNS.items():
+for i, line in enumerate(lines, 1):
+if pat.search(line):
+findings.append(Finding(
+id="CODE-" + pid,
+title=pid,
+severity=sev,
+category="CODE",
+file_path=rel_path,
+line_number=i,
+code_snippet=line.strip()[:200],
+description=desc,
+remediation=self._fix(pid),
+source_tool="nexus.code",
+))
+return findings
+
+def _fix(self, pid):
+return {
+"EVAL_USAGE": "Utiliser ast.literal_eval ou un parseur dédié.",
+"EXEC_USAGE": "Éviter. Si nécessaire, sandbox + validation stricte.",
+"OS_SYSTEM": "Utiliser subprocess.run([...]) sans shell=True.",
+"SUBPROCESS_SHELL": "Passer les arguments sous forme de liste.",
+"PICKLE_LOAD": "Préférer json ou une sérialisation signée.",
+"YAML_UNSAFE": "yaml.load(x, Loader=yaml.SafeLoader).",
+"SQL_STRING": "Paramétrer les requêtes (placeholders).",
+"MD5_HASH": "Passer à sha256 ou argon2.",
+"SHA1_HASH": "Passer à sha256 ou argon2.",
+"RANDOM_SECRET": "Utiliser secrets.token_*().",
+"DEBUG_TRUE": "Désactiver en production.",
+"VERIFY_FALSE": "Retirer verify=False.",
+"CORS_ALL": "Restreindre aux origines nécessaires.",
+"HARDCODED_TOKEN": "Utiliser une variable d'environnement.",
+"TLS_OLD": "Forcer TLS 1.2+.",
+"HTML_UNESCAPED": "Utiliser textContent ou une lib de sanitization.",
+"DANGEROUS_HTML": "Sanitizer avant injection.",
+}.get(pid, "Corriger selon les bonnes pratiques.")
+
+
+class WorkflowEngine(EngineBase):
+name = "workflow"
+
+def scan_file(self, rel_path, abs_path, content):
+if ".github/workflows/" not in rel_path.replace("\\", "/"):
+return []
+findings = []
+lines = content.splitlines()
+for pid, (pat, sev, desc) in WORKFLOW_PATTERNS.items():
+for i, line in enumerate(lines, 1):
+if pat.search(line):
+findings.append(Finding(
+id="WF-" + pid,
+title=pid,
+severity=sev,
+category="WORKFLOW",
+file_path=rel_path,
+line_number=i,
+code_snippet=line.strip()[:200],
+description=desc,
+remediation="Voir GitHub Actions security hardening.",
+reference="https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions",
+source_tool="nexus.workflow",
+))
+return findings
+
+
+class DependencyEngine(EngineBase):
+name = "dependencies"
+
+def scan_file(self, rel_path, abs_path, content):
+fname = os.path.basename(rel_path)
+if fname not in DEP_FILES:
+return []
+findings = []
+if fname == "requirements.txt":
+for i, line in enumerate(content.splitlines(), 1):
+s = line.strip()
+if not s or s.startswith("#"):
+continue
+if "==" not in s and ">=" not in s and "~=" not in s:
+findings.append(Finding(
+id="DEP-UNPINNED",
+title="Dépendance non pinée",
+severity="MEDIUM",
+category="DEPENDENCIES",
+file_path=rel_path,
+line_number=i,
+code_snippet=s[:120],
+description="Aucune version fixée — risque de supply chain.",
+remediation="Fixer la version (==X.Y.Z).",
+source_tool="nexus.deps",
+))
+if fname == "package.json":
+try:
+data = json.loads(content)
+except Exception:
+return findings
+for section in ("dependencies", "devDependencies"):
+deps = data.get(section, {})
+for pkg, ver in deps.items():
+if ver in ("*", "latest") or ver.startswith("^") or ver.startswith("~"):
+findings.append(Finding(
+id="DEP-LOOSE",
+title="Version de dépendance flottante",
+severity="LOW",
+category="DEPENDENCIES",
+file_path=rel_path,
+line_number=0,
+code_snippet="{}: {}".format(pkg, ver),
+description="Version flottante (^, ~, *).",
+remediation="Fixer la version exacte pour la prod.",
+source_tool="nexus.deps",
+))
+return findings
+
+
+class LicenseEngine(EngineBase):
+name = "license"
+
+def scan_file(self, rel_path, abs_path, content):
+fname = os.path.basename(rel_path).upper()
+if not (fname.startswith("LICENSE") or fname.startswith("COPYING")):
+return []
+content_low = content.lower()
+findings = []
+for lic, note in LICENSE_BAD.items():
+if lic.lower().replace("-", " ") in content_low or lic.lower() in content_low:
+findings.append(Finding(
+id="LIC-" + lic.replace(".", "_").replace("-", "_"),
+title="Licence : " + lic,
+severity="LOW",
+category="LICENSE",
+file_path=rel_path,
+line_number=0,
+code_snippet=lic,
+description=note,
+remediation="Vérifier la compatibilité avec votre usage.",
+source_tool="nexus.license",
+))
+return findings
+
+
+class ExternalEngine(EngineBase):
+def __init__(self, tool):
+self.name = "ext." + tool
+self.tool = tool
+
+def available(self):
+try:
+subprocess.run([self.tool, "--version"],
+capture_output=True, timeout=5)
+return True
+except Exception:
+return False
+
+def scan_meta(self, repo_path, metadata):
+if not self.available():
+return []
+if self.tool == "semgrep":
+return self._semgrep(repo_path)
+if self.tool == "bandit":
+return self._bandit(repo_path)
+if self.tool == "trivy":
+return self._trivy(repo_path, metadata.get("dep_files", []))
+return []
+
+def _semgrep(self, repo_path):
+findings = []
+try:
+r = subprocess.run(
+["semgrep", "scan", "--config=auto", "--json", "--quiet",
+"--metrics=off", repo_path],
+capture_output=True, text=True, timeout=SCAN_TIMEOUT,
+)
+if not r.stdout:
+return findings
+data = json.loads(r.stdout)
+for item in data.get("results", [])[:500]:
+sev = item.get("extra", {}).get("severity", "INFO").upper()
+sev_map = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
+findings.append(Finding(
+id="SEM-" + str(item.get("check_id", "?"))[:20],
+title=item.get("check_id", "semgrep"),
+severity=sev_map.get(sev, "MEDIUM"),
+category="SAST",
+file_path=item.get("path", ""),
+line_number=item.get("start", {}).get("line", 0),
+code_snippet=(item.get("extra", {}).get("lines") or "")[:200],
+description=item.get("extra", {}).get("message", "")[:300],
+source_tool="semgrep",
+))
+except Exception as e:
+logger.debug("semgrep KO: " + str(e)[:80])
+return findings
+
+def _bandit(self, repo_path):
+findings = []
+try:
+r = subprocess.run(
+["bandit", "-r", repo_path, "-f", "json", "-ll"],
+capture_output=True, text=True, timeout=SCAN_TIMEOUT,
+)
+if not r.stdout:
+return findings
+data = json.loads(r.stdout)
+for item in data.get("results", [])[:500]:
+sev = item.get("issue_severity", "LOW").upper()
+findings.append(Finding(
+id="BAND-" + str(item.get("test_id", "?")),
+title=item.get("test_name", "bandit"),
+severity=sev,
+category="SAST",
+file_path=item.get("filename", ""),
+line_number=item.get("line_number", 0),
+code_snippet=(item.get("code") or "")[:200],
+description=item.get("issue_text", "")[:300],
+source_tool="bandit",
+))
+except Exception as e:
+logger.debug("bandit KO: " + str(e)[:80])
+return findings
+
+def _trivy(self, repo_path, dep_files):
+findings = []
+try:
+r = subprocess.run(
+["trivy", "fs", "--format", "json", "--quiet",
+"--scanners", "vuln,secret", repo_path],
+capture_output=True, text=True, timeout=SCAN_TIMEOUT,
+)
+if not r.stdout:
+return findings
+data = json.loads(r.stdout)
+for res in data.get("Results", []):
+for v in res.get("Vulnerabilities", [])[:200]:
+findings.append(Finding(
+id="TRV-" + str(v.get("VulnerabilityID", "?")),
+title=v.get("Title", "vuln")[:80],
+severity=v.get("Severity", "UNKNOWN").upper(),
+category="DEPENDENCIES",
+file_path=res.get("Target", ""),
+line_number=0,
+code_snippet="{} {} → {}".format(
+v.get("PkgName", ""),
+v.get("InstalledVersion", ""),
+v.get("FixedVersion", "N/A")),
+description=(v.get("Description") or "")[:300],
+cve=v.get("VulnerabilityID", ""),
+reference=v.get("PrimaryURL", ""),
+remediation="Mettre à jour vers {}".format(
+v.get("FixedVersion", "N/A")),
+source_tool="trivy",
+))
+except Exception as e:
+logger.debug("trivy KO: " + str(e)[:80])
+return findings
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 7 · ORCHESTRATEUR
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AuditEngine:
+def __init__(self):
+self.engines = [
+SecretsEngine(),
+CodeEngine(),
+WorkflowEngine(),
+DependencyEngine(),
+LicenseEngine(),
+ExternalEngine("semgrep"),
+ExternalEngine("bandit"),
+ExternalEngine("trivy"),
+]
+
+def ingest(self, target, job_id):
+name = os.path.basename(target.rstrip("/").replace(".git", "")) or "repo"
+safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)[:40]
+dst = WORKSPACE / (safe_name + "_" + job_id)
+if dst.exists():
+shutil.rmtree(dst, ignore_errors=True)
+
+if os.path.isdir(target):
+# CORRECTION : copie robuste
+shutil.copytree(target, dst, symlinks=True,
+ignore=shutil.ignore_patterns(*SKIP_DIRS),
+ignore_dangling_symlinks=True)
+return dst, {"source_type": "local"}
+if target.startswith(("http", "git@", "ssh://")):
+try:
+r = subprocess.run(
+["git", "clone", "--depth", "1", target, str(dst)],
+capture_output=True, text=True, timeout=SCAN_TIMEOUT,
+)
+if r.returncode != 0:
+raise RuntimeError(r.stderr[:300])
+return dst, {"source_type": "git"}
+except FileNotFoundError:
+raise RuntimeError("git non installé")
+raise ValueError("Cible invalide : " + target)
+
+def walk_files(self, repo_path):
+for root, dirs, files in os.walk(repo_path):
+dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+for f in files:
+fp = Path(root) / f
+try:
+if fp.stat().st_size > MAX_FILE_SIZE:
+continue
+except OSError:
+continue
+ext = fp.suffix.lower()
+if ext in CODE_EXT or f in DEP_FILES or f.upper().startswith("LICENSE"):
+yield fp
+
+def audit(self, target, progress_cb=None):
+report = AuditReport(
+id=uuid.uuid4().hex[:12],
+target=target,
+started_at=datetime.now().isoformat(),
+)
+t0 = time.time()
+repo_path = None
+findings = []
+
+try:
+if progress_cb:
+progress_cb("ingest", 0, "Récupération de la cible")
+repo_path, meta = self.ingest(target, report.id)
+report.metadata = meta
+
+files = list(self.walk_files(repo_path))
+total = len(files) or 1
+if progress_cb:
+progress_cb("scan", 0, "Scan de {} fichiers".format(total))
+
+for i, fp in enumerate(files, 1):
+try:
+rel = str(fp.relative_to(repo_path))
+content = fp.read_text(encoding="utf-8", errors="ignore")
+report.files_scanned += 1
+for engine in self.engines:
+if not isinstance(engine, ExternalEngine):
+try:
+findings.extend(engine.scan_file(rel, str(fp), content))
+except Exception as e:
+report.errors.append("{} {}: {}".format(
+engine.name, rel, str(e)[:80]))
+except Exception as e:
+report.errors.append(str(e)[:100])
+if progress_cb and i % 10 == 0:
+progress_cb("scan", int(i / total * 80),
+"Scanné {}/{}".format(i, total))
+
+if progress_cb:
+progress_cb("meta", 85, "Analyse des dépendances (trivy)")
+dep_files = []
+for root, dirs, files_ in os.walk(repo_path):
+dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+for f in files_:
+if f in DEP_FILES:
+dep_files.append(str(Path(root) / f))
+meta_info = {"dep_files": dep_files}
+for engine in self.engines:
+if isinstance(engine, ExternalEngine):
+try:
+findings.extend(engine.scan_meta(str(repo_path), meta_info))
+except Exception as e:
+report.errors.append(str(e)[:100])
+
+if progress_cb:
+progress_cb("dedup", 95, "Déduplication")
+
+except Exception as e:
+report.errors.append(str(e)[:300])
+logger.error(traceback.format_exc())
+
+findings = self._dedup(findings)
+
+sev_order = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3,
+"LOW": 2, "INFO": 1, "UNKNOWN": 0}
+findings.sort(key=lambda x: -sev_order.get(x.severity, 0))
+
+stats = {}
+for f in findings:
+stats[f.severity] = stats.get(f.severity, 0) + 1
+
+weights = {"CRITICAL": 10, "HIGH": 5, "MEDIUM": 2,
+"LOW": 0.5, "INFO": 0.1, "UNKNOWN": 0}
+raw = sum(weights.get(f.severity, 0) for f in findings)
+risk = min(100.0, math.sqrt(raw) * 5) if raw > 0 else 0.0
+if risk >= 75:
+level = "CRITICAL"
+elif risk >= 50:
+level = "HIGH"
+elif risk >= 25:
+level = "MEDIUM"
+elif risk > 0:
+level = "LOW"
+else:
+level = "NONE"
+
+report.findings = findings
+report.stats = stats
+report.risk_score = risk
+report.risk_level = level
+report.finished_at = datetime.now().isoformat()
+report.duration_s = time.time() - t0
+report.status = "done"
+
+if repo_path and report.metadata.get("source_type") == "git":
+try:
+shutil.rmtree(repo_path, ignore_errors=True)
+except Exception:
+pass
+
+if progress_cb:
+progress_cb("done", 100, "Terminé — {} findings".format(len(findings)))
+
+return report
+
+def _dedup(self, findings):
+seen = {}
+order = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3,
+"LOW": 2, "INFO": 1, "UNKNOWN": 0}
+for f in findings:
+key = (f.file_path, f.line_number, f.category, f.title[:40])
+if key not in seen:
+seen[key] = f
+else:
+if order.get(f.severity, 0) > order.get(seen[key].severity, 0):
+seen[key] = f
+return list(seen.values())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 8 · BASE SQLITE
+# ═══════════════════════════════════════════════════════════════════════════
+
+class DB:
+def __init__(self, path):
+self.path = str(path)
+self.lock = threading.RLock()
+self._conn = None
+self._init()
+
+def _c(self):
+if self._conn is None:
+self._conn = sqlite3.connect(self.path, check_same_thread=False)
+self._conn.execute("PRAGMA journal_mode=WAL")
+return self._conn
+
+def _init(self):
+with self.lock:
+c = self._c()
+c.executescript("""
+CREATE TABLE IF NOT EXISTS audits (
+id TEXT PRIMARY KEY,
+target TEXT,
+started_at TEXT,
+finished_at TEXT,
+duration_s REAL,
+files_scanned INTEGER,
+total_findings INTEGER,
+critical INTEGER,
+high INTEGER,
+medium INTEGER,
+low INTEGER,
+risk_score REAL,
+risk_level TEXT,
+status TEXT,
+report_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_target ON audits(target);
+CREATE INDEX IF NOT EXISTS idx_started ON audits(started_at);
+""")
+c.commit()
+
+def save(self, report):
+with self.lock:
+c = self._c()
+stats = report.stats or {}
+d = report.to_dict()
+c.execute(
+"""INSERT OR REPLACE INTO audits
+(id,target,started_at,finished_at,duration_s,files_scanned,
+total_findings,critical,high,medium,low,risk_score,risk_level,
+status,report_json)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+(report.id, report.target, report.started_at,
+report.finished_at, report.duration_s,
+report.files_scanned, len(report.findings),
+stats.get("CRITICAL", 0), stats.get("HIGH", 0),
+stats.get("MEDIUM", 0), stats.get("LOW", 0),
+report.risk_score, report.risk_level,
+report.status, json.dumps(d, ensure_ascii=False)),
+)
+c.commit()
+
+def get(self, audit_id):
+with self.lock:
+c = self._c()
+row = c.execute(
+"SELECT report_json FROM audits WHERE id = ?",
+(audit_id,)
+).fetchone()
+if row:
+return json.loads(row[0])
+return None
+
+def list_recent(self, limit=50):
+with self.lock:
+c = self._c()
+rows = c.execute(
+"""SELECT id,target,started_at,duration_s,total_findings,
+risk_score,risk_level,status
+FROM audits ORDER BY started_at DESC LIMIT ?""",
+(limit,)
+).fetchall()
+return [
+{"id": r[0], "target": r[1], "started_at": r[2],
+"duration_s": r[3], "total_findings": r[4],
+"risk_score": r[5], "risk_level": r[6], "status": r[7]}
+for r in rows
+]
+
+
+DB_INSTANCE = DB(DB_FILE)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 9 · GESTIONNAIRE DE JOBS
+# ═══════════════════════════════════════════════════════════════════════════
+
+class JobManager:
+def __init__(self):
+self.lock = threading.RLock()
+self.jobs = {}
+self.engine = AuditEngine()
+
+def start(self, target):
+job_id = uuid.uuid4().hex[:12]
+job = {
+"id": job_id,
+"target": target,
+"started_at": datetime.now().isoformat(),
+"progress": 0,
+"step": "queued",
+"message": "En attente",
+"report": None,
+"queue": queue.Queue(),
+"done": False,
+}
+with self.lock:
+self.jobs[job_id] = job
+
+def worker():
+def progress_cb(step, pct, msg):
+with self.lock:
+job["step"] = step
+job["progress"] = pct
+job["message"] = msg
+try:
+job["queue"].put_nowait({
+"step": step, "progress": pct, "message": msg,
+})
+except queue.Full:
+pass
+
+try:
+report = self.engine.audit(target, progress_cb=progress_cb)
+DB_INSTANCE.save(report)
+job["report"] = report.to_dict()
+except Exception as e:
+job["message"] = "Erreur : " + str(e)[:200]
+finally:
+job["done"] = True
+try:
+job["queue"].put_nowait({"step": "done",
+"progress": 100,
+"message": "Terminé"})
+except queue.Full:
+pass
+
+threading.Thread(target=worker, daemon=True).start()
+return job_id
+
+def get(self, job_id):
+with self.lock:
+return self.jobs.get(job_id)
+
+
+JOBS = JobManager()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 10 · EXPORT SARIF 2.1.0
+# ═══════════════════════════════════════════════════════════════════════════
+
+def to_sarif(report_dict):
+results = []
+for f in report_dict.get("findings", []):
+sev_map = {"CRITICAL": "error", "HIGH": "error",
+"MEDIUM": "warning", "LOW": "note", "INFO": "note"}
+# CORRECTION : SARIF exige startLine >= 1
+line = max(1, int(f.get("line_number") or 0))
+results.append({
+"ruleId": f.get("id", "unknown"),
+"level": sev_map.get(f.get("severity", "LOW"), "warning"),
+"message": {"text": f.get("description", "")},
+"locations": [{
+"physicalLocation": {
+"artifactLocation": {"uri": f.get("file_path", "")},
+"region": {"startLine": line},
+}
+}],
+})
+return {
+"version": "2.1.0",
+"$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+"runs": [{
+"tool": {
+"driver": {
+"name": "NEXUS-SENTINEL",
+"version": VERSION,
+"informationUri": "https://github.com/aissa-mohammedi/nexus-sentinel",
+}
+},
+"results": results,
+}],
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 11 · UI HTML
+# ═══════════════════════════════════════════════════════════════════════════
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NEXUS SENTINEL v__V__</title>
+<style>
+:root{
+--bg:#0a0a0a;--card:#111;--card2:#171717;--bd:#1f1f1f;--bd2:#2a2a2a;
+--tx:#f0f0f0;--mid:#a0a0a0;--dim:#606060;
+--cy:#4c9aff;--gr:#4ade80;--or:#f5a623;--rd:#f85149;--vi:#a855f7;--mg:#ff2d95;
+--mono:ui-monospace,'JetBrains Mono',Menlo,monospace;
+--ui:-apple-system,BlinkMacSystemFont,'Inter',system-ui,sans-serif;
+}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;background:var(--bg);color:var(--tx);
+font-family:var(--ui);font-size:15px;line-height:1.55;
+-webkit-font-smoothing:antialiased;letter-spacing:-0.011em}
+.wrap{max-width:1200px;margin:0 auto;padding:24px 20px 80px}
+.head{display:flex;justify-content:space-between;align-items:center;
+padding:14px 18px;background:rgba(10,10,10,.8);backdrop-filter:blur(20px);
+border:1px solid var(--bd);border-radius:12px;margin-bottom:24px;flex-wrap:wrap;gap:12px}
+.brand{display:flex;align-items:center;gap:12px;font-family:var(--mono);font-size:13px;color:var(--mid)}
+.icon{width:32px;height:32px;border-radius:8px;
+background:linear-gradient(135deg,var(--rd),var(--or));
+display:flex;align-items:center;justify-content:center;font-size:16px;
+box-shadow:0 0 20px rgba(248,81,73,.45)}
+.brand b{color:var(--tx)}.brand .s{color:var(--dim);margin:0 5px}
+.chip{font-family:var(--mono);font-size:11px;padding:4px 10px;border-radius:999px;
+border:1px solid var(--bd);background:var(--card2);color:var(--mid);font-weight:500}
+.chip.live{color:var(--gr);border-color:rgba(74,222,128,.35);
+background:rgba(74,222,128,.08);display:inline-flex;align-items:center;gap:6px}
+.chip.live::before{content:'';width:6px;height:6px;border-radius:50%;
+background:var(--gr);box-shadow:0 0 8px var(--gr);
+animation:p 1.4s ease-in-out infinite}
+@keyframes p{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.85)}}
+.hero{text-align:center;margin-bottom:28px;padding:20px 16px}
+.eyebrow{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);
+font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--mid);
+padding:6px 14px;border:1px solid var(--bd);border-radius:999px;
+background:rgba(255,255,255,.02);margin-bottom:16px}
+.eyebrow .dot{width:6px;height:6px;border-radius:50%;background:var(--rd);
+box-shadow:0 0 12px var(--rd)}
+h1{font-size:clamp(30px,5vw,50px);font-weight:800;letter-spacing:-.04em;
+line-height:1.02;margin-bottom:12px;
+background:linear-gradient(180deg,#fff 0%,#a0a0a0 100%);
+-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+h1 .a{display:block;background:linear-gradient(90deg,var(--rd),var(--or),var(--mg));
+-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.lede{font-size:clamp(14px,1.6vw,16px);color:var(--mid);max-width:640px;margin:0 auto}
+.search-row{display:flex;gap:8px;margin-bottom:14px}
+.search-row input{flex:1;padding:14px 18px;background:var(--card);border:1px solid var(--bd);
+border-radius:10px;color:var(--tx);font-family:var(--mono);font-size:14px;outline:none;
+transition:all .15s}
+.search-row input:focus{border-color:var(--cy);box-shadow:0 0 0 3px rgba(76,154,255,.12)}
+.search-row button{padding:14px 24px;background:var(--cy);border:1px solid var(--cy);
+border-radius:10px;color:#000;font-weight:700;font-family:var(--ui);font-size:14px;
+cursor:pointer;transition:all .15s;letter-spacing:.02em}
+.search-row button:hover{background:#5aa5ff;border-color:#5aa5ff}
+.search-row button:disabled{opacity:.5;cursor:wait}
+.examples{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:20px}
+.ex{font-size:11px;padding:4px 10px;background:var(--card2);border:1px solid var(--bd);
+border-radius:14px;color:var(--mid);cursor:pointer;font-family:var(--mono)}
+.ex:hover{color:var(--cy);border-color:var(--cy)}
+.progress{background:var(--card);border:1px solid var(--bd);border-radius:10px;
+padding:14px 18px;margin-bottom:18px;display:none}
+.progress.on{display:block}
+.progress .lbl{display:flex;justify-content:space-between;font-family:var(--mono);
+font-size:12px;color:var(--mid);margin-bottom:8px}
+.progress .bar{height:4px;background:var(--card2);border-radius:2px;overflow:hidden}
+.progress .fill{height:100%;background:linear-gradient(90deg,var(--cy),var(--vi));
+transition:width .3s;border-radius:2px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:20px}
+.stat{background:var(--card);border:1px solid var(--bd);border-radius:10px;
+padding:14px 16px;text-align:center;transition:all .15s}
+.stat:hover{border-color:var(--bd2);transform:translateY(-1px)}
+.stat .n{font-family:var(--mono);font-size:26px;font-weight:800;line-height:1;
+font-variant-numeric:tabular-nums}
+.stat .l{font-family:var(--mono);font-size:10px;letter-spacing:.14em;
+text-transform:uppercase;color:var(--dim);margin-top:6px;font-weight:500}
+.stat.crit .n{color:var(--rd)}
+.stat.high .n{color:var(--or)}
+.stat.med .n{color:var(--cy)}
+.stat.low .n{color:var(--gr)}
+.stat.risk .n{color:var(--vi)}
+.filters{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px}
+.filter{padding:6px 14px;background:var(--card2);border:1px solid var(--bd);
+border-radius:20px;font-size:12px;color:var(--mid);cursor:pointer;
+font-family:var(--mono);transition:all .15s}
+.filter.on{background:var(--cy);color:#000;border-color:var(--cy);font-weight:700}
+.finding{background:var(--card);border:1px solid var(--bd);border-left:3px solid var(--dim);
+border-radius:10px;padding:14px 18px;margin-bottom:10px;transition:all .15s}
+.finding:hover{border-color:var(--bd2);transform:translateX(2px)}
+.finding.CRITICAL{border-left-color:var(--rd)}
+.finding.HIGH{border-left-color:var(--or)}
+.finding.MEDIUM{border-left-color:var(--cy)}
+.finding.LOW{border-left-color:var(--gr)}
+.finding.INFO{border-left-color:var(--dim)}
+.finding .head{display:flex;align-items:baseline;gap:10px;margin-bottom:6px;flex-wrap:wrap}
+.finding .sev{font-family:var(--mono);font-size:10px;padding:2px 8px;
+border-radius:5px;font-weight:800;letter-spacing:.05em}
+.finding .sev.CRITICAL{background:rgba(248,81,73,.15);color:var(--rd)}
+.finding .sev.HIGH{background:rgba(245,166,35,.15);color:var(--or)}
+.finding .sev.MEDIUM{background:rgba(76,154,255,.15);color:var(--cy)}
+.finding .sev.LOW{background:rgba(74,222,128,.15);color:var(--gr)}
+.finding .sev.INFO{background:rgba(160,160,160,.15);color:var(--dim)}
+.finding .title{font-size:15px;font-weight:600;color:var(--tx);flex:1}
+.finding .cat{font-family:var(--mono);font-size:10px;color:var(--dim);
+text-transform:uppercase;letter-spacing:.1em}
+.finding .loc{font-family:var(--mono);font-size:11px;color:var(--cy);margin:4px 0}
+.finding .desc{color:var(--mid);font-size:13px;margin:4px 0;line-height:1.5}
+.finding .snippet{background:#000;border:1px solid var(--bd);border-radius:6px;
+padding:8px 12px;margin:8px 0;font-family:var(--mono);font-size:11px;
+color:var(--or);overflow-x:auto;white-space:pre}
+.finding .fix{font-size:12px;color:var(--gr);margin-top:6px}
+.finding .fix::before{content:'🔧 ';}
+.empty{text-align:center;padding:40px;color:var(--dim);font-family:var(--mono);font-size:13px}
+table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px;
+font-variant-numeric:tabular-nums}
+th{text-align:left;padding:8px 10px;font-size:10px;letter-spacing:.14em;
+text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--bd);
+font-weight:600}
+td{padding:8px 10px;border-bottom:1px solid var(--bd);color:var(--mid)}
+tr:hover td{background:rgba(76,154,255,.03);color:var(--tx)}
+.foot{text-align:center;margin-top:32px;padding-top:20px;border-top:1px solid var(--bd);
+font-family:var(--mono);font-size:11px;color:var(--dim);letter-spacing:.05em}
+.foot b{color:var(--cy)}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+.act{padding:8px 14px;background:var(--card2);border:1px solid var(--bd);
+border-radius:8px;font-size:12px;color:var(--mid);text-decoration:none;
+cursor:pointer;font-family:var(--mono);transition:all .15s}
+.act:hover{color:var(--cy);border-color:var(--cy)}
+.history-card{background:var(--card);border:1px solid var(--bd);border-radius:12px;
+padding:16px 20px;margin-bottom:14px}
+.history-card h3{color:var(--cy);font-size:11px;letter-spacing:.14em;
+text-transform:uppercase;margin-bottom:12px;font-weight:600}
+@media(max-width:640px){
+.wrap{padding:14px 12px 60px}
+.search-row{flex-direction:column}
+.finding{padding:12px 14px}
+.finding .title{font-size:14px}
+th,td{padding:6px 8px;font-size:11px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="head">
+<div class="brand">
+<div class="icon">🛡</div>
+<div><b>NEXUS</b><span class="s">/</span>SENTINEL</div>
+</div>
+<div>
+<span class="chip live">LIVE</span>
+<span class="chip">v__V__</span>
+<span class="chip" id="engines">-- moteurs</span>
+<span class="chip">Port __PORT__</span>
+</div>
+</div>
+
+<section class="hero">
+<div class="eyebrow">
+<span class="dot"></span>
+AUDIT DE SÉCURITÉ · LOCAL · TEMPS RÉEL
+</div>
+<h1>Sentinel
+<span class="a">Audit souverain</span>
+</h1>
+<p class="lede">
+Secrets · anti-patterns · workflows · dépendances · licences.
+6 moteurs internes + semgrep / bandit / trivy si installés.
+Export SARIF pour intégration CI.
+</p>
+</section>
+
+<div class="search-row">
+<input id="target" placeholder="URL GitHub ou chemin local"
+value="https://github.com/OWASP/NodeGoat">
+<button id="btn" onclick="startAudit()">Lancer l'audit</button>
+</div>
+
+<div class="examples">
+<span class="ex" onclick="setTarget('https://github.com/OWASP/NodeGoat')">OWASP NodeGoat</span>
+<span class="ex" onclick="setTarget('https://github.com/OWASP/WebGoat')">OWASP WebGoat</span>
+<span class="ex" onclick="setTarget('https://github.com/juice-shop/juice-shop')">Juice Shop</span>
+<span class="ex" onclick="setTarget('.')">Dossier courant</span>
+</div>
+
+<div class="progress" id="progress">
+<div class="lbl"><span id="pStep">queued</span><span id="pPct">0%</span></div>
+<div class="bar"><div class="fill" id="pFill" style="width:0%"></div></div>
+<div style="margin-top:6px;font-size:11px;color:var(--dim);font-family:var(--mono)"
+id="pMsg">—</div>
+</div>
+
+<div class="grid" id="grid" style="display:none">
+<div class="stat crit"><div class="n" id="sCrit">0</div><div class="l">Critique</div></div>
+<div class="stat high"><div class="n" id="sHigh">0</div><div class="l">Haut</div></div>
+<div class="stat med"><div class="n" id="sMed">0</div><div class="l">Moyen</div></div>
+<div class="stat low"><div class="n" id="sLow">0</div><div class="l">Bas</div></div>
+<div class="stat risk"><div class="n" id="sRisk">0</div><div class="l">Score risque</div></div>
+<div class="stat"><div class="n" id="sFiles">0</div><div class="l">Fichiers</div></div>
+</div>
+
+<div id="actions" class="actions" style="display:none">
+<a class="act" id="dlJson" download="report.json">⬇ JSON</a>
+<a class="act" id="dlSarif" download="report.sarif">⬇ SARIF</a>
+<a class="act" id="dlMd" download="report.md">⬇ Markdown</a>
+</div>
+
+<div class="filters" id="filters" style="display:none">
+<div class="filter on" onclick="setFilter('all', this)">Tout</div>
+<div class="filter" onclick="setFilter('CRITICAL', this)">Critique</div>
+<div class="filter" onclick="setFilter('HIGH', this)">Haut</div>
+<div class="filter" onclick="setFilter('MEDIUM', this)">Moyen</div>
+<div class="filter" onclick="setFilter('LOW', this)">Bas</div>
+</div>
+
+<div id="results"></div>
+
+<div class="history-card">
+<h3>◆ Historique récent</h3>
+<div id="history"><div class="empty">Aucun audit</div></div>
+</div>
+
+<div class="foot">
+<b>NEXUS SENTINEL v__V__</b> · Aissa Mohammedi (DGK) ·
+Audit local · Zero cloud · SARIF ready
+</div>
+
+</div>
+
+<script>
+(function(){
+'use strict';
+let currentFindings = [];
+let currentFilter = 'all';
+let currentEventSource = null;
+
+function esc(s){
+const d = document.createElement('div');
+d.textContent = s == null ? '' : String(s);
+return d.innerHTML;
+}
+
+window.setTarget = function(t){
+document.getElementById('target').value = t;
+};
+
+window.setFilter = function(f, el){
+document.querySelectorAll('.filter').forEach(x => x.classList.remove('on'));
+el.classList.add('on');
+currentFilter = f;
+renderFindings();
+};
+
+async function startAudit(){
+const target = document.getElementById('target').value.trim();
+if (!target) return;
+
+const btn = document.getElementById('btn');
+btn.disabled = true;
+btn.textContent = 'Audit…';
+
+document.getElementById('results').innerHTML = '';
+document.getElementById('grid').style.display = 'none';
+document.getElementById('filters').style.display = 'none';
+document.getElementById('actions').style.display = 'none';
+document.getElementById('progress').classList.add('on');
+setProgress('queued', 0, 'Envoi de la cible…');
+
+try {
+const r = await fetch('/api/audit', {
+method: 'POST',
+headers: {'Content-Type': 'application/json'},
+body: JSON.stringify({target: target}),
+});
+const d = await r.json();
+if (!d.job_id){
+throw new Error(d.error || 'pas de job_id');
+}
+watchJob(d.job_id);
+} catch(e){
+setProgress('error', 0, 'Erreur : ' + e.message);
+btn.disabled = false;
+btn.textContent = "Lancer l'audit";
+}
+}
+
+window.startAudit = startAudit;
+
+function setProgress(step, pct, msg){
+document.getElementById('pStep').textContent = step;
+document.getElementById('pPct').textContent = pct + '%';
+document.getElementById('pFill').style.width = pct + '%';
+document.getElementById('pMsg').textContent = msg;
+}
+
+function watchJob(jobId){
+if (currentEventSource){
+try { currentEventSource.close(); } catch(e){}
+}
+const es = new EventSource('/api/stream/' + jobId);
+currentEventSource = es;
+
+es.onmessage = function(ev){
+try {
+const d = JSON.parse(ev.data);
+if (d.type === 'progress'){
+setProgress(d.step, d.progress, d.message);
+} else if (d.type === 'done'){
+setProgress('done', 100, 'Terminé');
+es.close();
+currentEventSource = null;
+loadReport(jobId);
+} else if (d.type === 'error'){
+setProgress('error', 0, d.message);
+es.close();
+currentEventSource = null;
+document.getElementById('btn').disabled = false;
+document.getElementById('btn').textContent = "Lancer l'audit";
+}
+} catch(e){}
+};
+
+es.onerror = function(){
+es.close();
+currentEventSource = null;
+loadReport(jobId);
+};
+}
+
+async function loadReport(jobId){
+try {
+const r = await fetch('/api/audit/' + jobId);
+const d = await r.json();
+renderReport(d);
+} catch(e){
+document.getElementById('results').innerHTML =
+'<div class="empty">Erreur chargement : ' + esc(e.message) + '</div>';
+} finally {
+document.getElementById('btn').disabled = false;
+document.getElementById('btn').textContent = "Lancer l'audit";
+document.getElementById('progress').classList.remove('on');
+loadHistory();
+}
+}
+
+function renderReport(d){
+const stats = d.stats || {};
+document.getElementById('sCrit').textContent = stats.CRITICAL || 0;
+document.getElementById('sHigh').textContent = stats.HIGH || 0;
+document.getElementById('sMed').textContent = stats.MEDIUM || 0;
+document.getElementById('sLow').textContent = stats.LOW || 0;
+document.getElementById('sRisk').textContent = (d.risk_score || 0).toFixed(1);
+document.getElementById('sFiles').textContent = d.files_scanned || 0;
+document.getElementById('grid').style.display = 'grid';
+
+document.getElementById('dlJson').href = '/api/audit/' + d.id + '/json';
+document.getElementById('dlSarif').href = '/api/audit/' + d.id + '/sarif';
+document.getElementById('dlMd').href = '/api/audit/' + d.id + '/md';
+document.getElementById('actions').style.display = 'flex';
+
+currentFindings = d.findings || [];
+currentFilter = 'all';
+document.querySelectorAll('.filter').forEach(x => x.classList.remove('on'));
+document.querySelectorAll('.filter')[0].classList.add('on');
+
+document.getElementById('filters').style.display = 'flex';
+renderFindings();
+}
+
+function renderFindings(){
+const el = document.getElementById('results');
+let list = currentFindings;
+if (currentFilter !== 'all'){
+list = list.filter(f => f.severity === currentFilter);
+}
+if (!list.length){
+el.innerHTML = '<div class="empty">Aucun finding dans ce filtre.</div>';
+return;
+}
+el.innerHTML = list.map(f => {
+let h = '<div class="finding ' + esc(f.severity) + '">';
+h += '<div class="head">';
+h += '<span class="sev ' + esc(f.severity) + '">' + esc(f.severity) + '</span>';
+h += '<span class="title">' + esc(f.title) + '</span>';
+h += '<span class="cat">' + esc(f.category) + '</span>';
+h += '</div>';
+if (f.file_path){
+h += '<div class="loc">' + esc(f.file_path) + ':' + esc(f.line_number) + '</div>';
+}
+if (f.description){
+h += '<div class="desc">' + esc(f.description) + '</div>';
+}
+if (f.code_snippet){
+h += '<div class="snippet">' + esc(f.code_snippet) + '</div>';
+}
+if (f.remediation){
+h += '<div class="fix">' + esc(f.remediation) + '</div>';
+}
+h += '</div>';
+return h;
+}).join('');
+}
+
+async function loadHistory(){
+try {
+const r = await fetch('/api/audits');
+const d = await r.json();
+const audits = d.audits || [];
+if (!audits.length){
+document.getElementById('history').innerHTML =
+'<div class="empty">Aucun audit</div>';
+return;
+}
+let h = '<table><thead><tr><th>ID</th><th>Cible</th><th>Date</th>' +
+'<th>Findings</th><th>Risque</th><th>Statut</th></tr></thead><tbody>';
+audits.forEach(a => {
+h += '<tr>';
+h += '<td>' + esc(a.id) + '</td>';
+h += '<td>' + esc((a.target || '').slice(0, 50)) + '</td>';
+h += '<td>' + esc((a.started_at || '').slice(0, 19)) + '</td>';
+h += '<td>' + esc(a.total_findings || 0) + '</td>';
+h += '<td>' + esc((a.risk_score || 0).toFixed(1)) + ' / ' + esc(a.risk_level || '') + '</td>';
+h += '<td>' + esc(a.status || '') + '</td>';
+h += '</tr>';
+});
+h += '</tbody></table>';
+document.getElementById('history').innerHTML = h;
+} catch(e){}
+}
+
+async function loadEngines(){
+try {
+const r = await fetch('/api/health');
+const d = await r.json();
+document.getElementById('engines').textContent = d.engines_available + ' moteurs';
+} catch(e){}
+}
+
+loadEngines();
+loadHistory();
+})();
+</script>
+</body>
+</html>"""
+
+
+def render_html():
+"""Rend le HTML avec les variables substituées."""
+return (HTML_TEMPLATE
+.replace("__V__", VERSION)
+.replace("__PORT__", str(PORT)))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 12 · HTTP HANDLER
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Handler(BaseHTTPRequestHandler):
+server_version = "NexusSentinel/" + VERSION
+protocol_version = "HTTP/1.1"
+
+def log_message(self, *a):
+pass
+
+def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None):
+if isinstance(body, str):
+body = body.encode("utf-8")
+try:
+self.send_response(code)
+self.send_header("Content-Type", ctype)
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Access-Control-Allow-Origin", "*")
+self.send_header("Cache-Control", "no-cache")
+if extra:
+for k, v in extra.items():
+self.send_header(k, v)
+self.end_headers()
+self.wfile.write(body)
+except (BrokenPipeError, ConnectionResetError):
+pass
+
+def _json(self, code, obj):
+try:
+body = json.dumps(obj, ensure_ascii=False, default=str)
+except Exception:
+body = "{}"
+self._send(code, body, "application/json; charset=utf-8")
+
+def _read_json(self):
+try:
+n = int(self.headers.get("Content-Length", 0))
+if n == 0:
+return {}
+return json.loads(self.rfile.read(n).decode("utf-8"))
+except Exception:
+return {}
+
+def do_GET(self):
+parsed = urllib.parse.urlparse(self.path)
+path = parsed.path
+parts = [p for p in path.split("/") if p]
+
+if not parts:
+return self._send(200, render_html())
+
+if parts[0] == "api":
+if len(parts) == 2 and parts[1] == "health":
+engines = JOBS.engine.engines
+available = sum(1 for e in engines if e.available())
+return self._json(200, {
+"ok": True,
+"version": VERSION,
+"author": AUTEUR,
+"license": LICENCE,
+"engines_total": len(engines),
+"engines_available": available,
+"engines": [{"name": e.name, "available": e.available()}
+for e in engines],
+})
+if len(parts) == 2 and parts[1] == "audits":
+return self._json(200, {"audits": DB_INSTANCE.list_recent(50)})
+if len(parts) == 3 and parts[1] == "audit":
+d = DB_INSTANCE.get(parts[2])
+if d:
+return self._json(200, d)
+return self._json(404, {"error": "audit introuvable"})
+if len(parts) == 4 and parts[1] == "audit":
+audit_id = parts[2]
+kind = parts[3]
+d = DB_INSTANCE.get(audit_id)
+if not d:
+return self._json(404, {"error": "audit introuvable"})
+if kind == "json":
+return self._send(
+200,
+json.dumps(d, indent=2, ensure_ascii=False, default=str),
+"application/json; charset=utf-8",
+{"Content-Disposition":
+'attachment; filename="report_' + audit_id + '.json"'})
+if kind == "sarif":
+sarif = to_sarif(d)
+return self._send(
+200,
+json.dumps(sarif, indent=2, ensure_ascii=False),
+"application/json; charset=utf-8",
+{"Content-Disposition":
+'attachment; filename="report_' + audit_id + '.sarif"'})
+if kind == "md":
+return self._send(
+200,
+self._to_markdown(d),
+"text/markdown; charset=utf-8",
+{"Content-Disposition":
+'attachment; filename="report_' + audit_id + '.md"'})
+if len(parts) == 3 and parts[1] == "stream":
+return self._stream(parts[2])
+return self._json(404, {"error": "not found"})
+
+return self._json(404, {"error": "not found"})
+
+def do_POST(self):
+parsed = urllib.parse.urlparse(self.path)
+if parsed.path == "/api/audit":
+payload = self._read_json()
+target = (payload.get("target") or "").strip()
+if not target:
+return self._json(400, {"error": "target manquant"})
+job_id = JOBS.start(target)
+return self._json(200, {"job_id": job_id, "target": target})
+return self._json(404, {"error": "not found"})
+
+def _stream(self, job_id):
+job = JOBS.get(job_id)
+if not job:
+return self._json(404, {"error": "job introuvable"})
+try:
+self.send_response(200)
+self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+self.send_header("Cache-Control", "no-cache, no-transform")
+self.send_header("Connection", "keep-alive")
+self.send_header("X-Accel-Buffering", "no")
+self.end_headers()
+
+while True:
+try:
+ev = job["queue"].get(timeout=2.0)
+data = {"type": "progress", **ev}
+if ev.get("step") == "done":
+data = {"type": "done", "report_id": job_id}
+try:
+self.wfile.write(
+("data: " + json.dumps(data) + "\n\n").encode()
+)
+self.wfile.flush()
+except (BrokenPipeError, ConnectionResetError):
+return
+if ev.get("step") == "done":
+break
+except queue.Empty:
+if job["done"]:
+try:
+self.wfile.write(
+("data: " + json.dumps({
+"type": "done", "report_id": job_id,
+}) + "\n\n").encode()
+)
+self.wfile.flush()
+except Exception:
+pass
+break
+try:
+self.wfile.write(b": ping\n\n")
+self.wfile.flush()
+except Exception:
+break
+except (BrokenPipeError, ConnectionResetError):
+pass
+except Exception as e:
+logger.debug("sse KO: " + str(e)[:100])
+
+def _to_markdown(self, d):
+lines = ["# NEXUS SENTINEL — Rapport d'audit", ""]
+lines.append("**Cible** : " + str(d.get("target", "")))
+lines.append("**Date** : " + str(d.get("started_at", "")))
+lines.append("**Durée** : " + str(d.get("duration_s", 0)) + " s")
+lines.append("**Fichiers scannés** : " + str(d.get("files_scanned", 0)))
+lines.append("**Findings** : " + str(len(d.get("findings", []))))
+lines.append("**Score de risque** : " + str(d.get("risk_score", 0)) +
+" (" + str(d.get("risk_level", "")) + ")")
+lines.append("")
+lines.append("## Répartition")
+lines.append("")
+lines.append("| Sévérité | Nombre |")
+lines.append("|----------|--------|")
+for sev, n in (d.get("stats") or {}).items():
+lines.append("| " + sev + " | " + str(n) + " |")
+lines.append("")
+lines.append("## Détail")
+lines.append("")
+for f in d.get("findings", []):
+lines.append("### [" + f.get("severity", "") + "] " + f.get("title", ""))
+if f.get("file_path"):
+lines.append("- **Fichier** : `" + f["file_path"] + ":" +
+str(f.get("line_number", 0)) + "`")
+if f.get("category"):
+lines.append("- **Catégorie** : " + f["category"])
+if f.get("description"):
+lines.append("- **Description** : " + f["description"])
+if f.get("code_snippet"):
+lines.append("```")
+lines.append(f["code_snippet"])
+lines.append("```")
+if f.get("remediation"):
+lines.append("- **Remédiation** : " + f["remediation"])
+lines.append("")
+return "\n".join(lines)
+
+
+class Server(ThreadingHTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 13 · MAIN
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_local_ip():
+try:
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+s.connect(("8.8.8.8", 80))
+ip = s.getsockname()[0]
+finally:
+s.close()
+return ip
+except Exception:
+return "localhost"
+
+
+def find_free_port(pref):
+for p in range(pref, pref + 20):
+try:
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((HOST, p))
+return p
+except OSError:
+continue
+return pref
+
+
+def main():
+port = find_free_port(PORT)
+engines = JOBS.engine.engines
+available = [e.name for e in engines if e.available()]
+
+print("")
+print("╔" + "═" * 68 + "╗")
+print("║" + " NEXUS SENTINEL v" + VERSION + " ".ljust(47) + "║")
+print("║" + " Audit souverain local · temps réel · SARIF ready ".ljust(67) + "║")
+print("╚" + "═" * 68 + "╝")
+print("")
+print(" Auteur : " + AUTEUR)
+print(" Licence : " + LICENCE)
+print(" Base : " + str(BASE))
+print("")
+print(" Moteurs disponibles ({}):".format(len(available)))
+for name in available:
+print(" ✓ " + name)
+print("")
+print(" Local : http://" + HOST + ":" + str(port) + "/")
+print(" Réseau : http://" + get_local_ip() + ":" + str(port) + "/")
+print("")
+print(" Endpoints :")
+print(" POST /api/audit → lancer un audit")
+print(" GET /api/audit/<id> → rapport complet")
+print(" GET /api/audit/<id>/sarif → export SARIF 2.1.0")
+print(" GET /api/audit/<id>/md → export Markdown")
+print(" GET /api/audits → historique")
+print(" GET /api/stream/<job> → progression SSE")
+print(" GET /api/health → état + moteurs")
+print("")
+print(" Ctrl+C pour arrêter")
+print("")
+
+logger.info("Démarrage Sentinel v" + VERSION)
+logger.info("Moteurs : " + ", ".join(available))
+
+try:
+srv = Server((HOST, port), Handler)
+srv.serve_forever()
+except KeyboardInterrupt:
+print("")
+logger.info("Arrêt")
+except OSError as e:
+print("[ERREUR] " + str(e))
+return 1
+
+return 0
+
+
+if __name__ == "__main__":
+sys.exit(main())
