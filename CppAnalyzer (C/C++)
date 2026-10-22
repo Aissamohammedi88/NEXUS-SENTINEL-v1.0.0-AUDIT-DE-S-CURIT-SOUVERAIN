@@ -1,0 +1,143 @@
+# ==============================================================================
+# SECTION 9.6 : MODULE 4.6 — ANALYSE C/C++ (Cppcheck + Clang-Tidy)
+# ==============================================================================
+
+class CppAnalyzer:
+    """Analyse statique pour le code C/C++ via Cppcheck et Clang-Tidy."""
+
+    def __init__(self):
+        self.findings: List[Finding] = []
+
+    def analyze(self, repo_path: str, metadata: Dict[str, Any]) -> List[Finding]:
+        langs = metadata.get("languages", {})
+        if "c" not in langs and "cpp" not in langs:
+            logger.info("Pas de fichiers C/C++ détectés, skip de l'analyse C/C++.")
+            return []
+
+        logger.info("⚙️ Analyse du code C/C++...")
+        self.findings = []
+
+        if self._is_tool_available(SentinelConfig.CPPCHECK_CMD):
+            self._run_cppcheck(repo_path)
+        else:
+            logger.warning("Cppcheck non disponible (installer : apt install cppcheck)")
+
+        if self._is_tool_available(SentinelConfig.CLANGTIDY_CMD):
+            self._run_clang_tidy(repo_path)
+        else:
+            logger.warning("Clang-Tidy non disponible (installer : apt install clang-tidy)")
+
+        logger.info(f"📊 C/C++ : {len(self.findings)} finding(s) détecté(s)")
+        return self.findings
+
+    def _is_tool_available(self, tool: str) -> bool:
+        try:
+            subprocess.run([tool, "--version"], capture_output=True, timeout=5)
+            return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    def _run_cppcheck(self, repo_path: str):
+        logger.info(" → Cppcheck en cours...")
+        try:
+            cmd = [SentinelConfig.CPPCHECK_CMD, "--enable=warning,style,performance,portability",
+                   "--xml", "--xml-version=2", "--quiet",
+                   "--suppress=missingIncludeSystem", repo_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=SentinelConfig.TIMEOUT)
+
+            if result.stderr:
+                self._parse_cppcheck_xml(result.stderr, repo_path)
+            elif result.stdout:
+                self._parse_cppcheck_xml(result.stdout, repo_path)
+            logger.info(f"  → {len(self.findings)} finding(s) Cppcheck détecté(s)")
+        except Exception as e:
+            logger.debug(f"Cppcheck erreur : {e}")
+
+    def _parse_cppcheck_xml(self, xml_content: str, repo_path: str):
+        try:
+            import xml.etree.ElementTree as ET
+            if not xml_content.strip().startswith('<?xml'):
+                xml_content = '<?xml version="1.0"?>\n' + xml_content
+            root = ET.fromstring(xml_content)
+
+            severity_map = {
+                "error": "HIGH", "warning": "MEDIUM",
+                "style": "LOW", "performance": "MEDIUM",
+                "portability": "MEDIUM"
+            }
+
+            for err in root.findall(".//error"):
+                err_id = err.get("id", "unknown")
+                sev = err.get("severity", "warning")
+                msg = err.get("msg", "")
+                file_path = err.get("file", "")
+                line_num = int(err.get("line", 0))
+
+                if not file_path:
+                    continue
+
+                rel_path = os.path.relpath(file_path, repo_path) if os.path.isabs(file_path) else file_path
+                self.findings.append(Finding(
+                    id=f"CPPCHECK-{err_id}-{hashlib.md5(f'{rel_path}:{line_num}'.encode()).hexdigest()[:6]}",
+                    title=f"Cppcheck : {err_id}",
+                    severity=severity_map.get(sev, "MEDIUM"),
+                    category="SAST",
+                    file_path=rel_path, line_number=line_num,
+                    code_snippet=msg[:200], description=msg,
+                    source_tool="cppcheck",
+                    remediation="Corriger selon les recommandations Cppcheck."
+                ))
+        except Exception as e:
+            logger.debug(f"Erreur parsing Cppcheck : {e}")
+
+    def _run_clang_tidy(self, repo_path: str):
+        logger.info(" → Clang-Tidy en cours...")
+
+        # Chercher un fichier compile_commands.json
+        compile_db = os.path.join(repo_path, "compile_commands.json")
+        if not os.path.exists(compile_db):
+            logger.warning("compile_commands.json introuvable. Clang-Tidy nécessite une base de compilation.")
+            return
+
+        # Trouver les fichiers C/C++
+        cpp_files = []
+        for root, dirs, files in os.walk(repo_path, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in ['.git', 'build', 'target', 'node_modules']]
+            for file in files:
+                if file.endswith(('.c', '.cpp', '.cc')):
+                    cpp_files.append(os.path.join(root, file))
+
+        if not cpp_files:
+            return
+
+        logger.info(f"  → {len(cpp_files)} fichier(s) à analyser par Clang-Tidy")
+
+        for cpp_file in cpp_files[:10]:  # Limiter à 10 pour éviter les timeouts
+            try:
+                cmd = [SentinelConfig.CLANGTIDY_CMD, "-p", repo_path,
+                       "--checks=-*,bugprone-*,cert-*,clang-analyzer-*,cppcoreguidelines-*",
+                       cpp_file]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+                for line in result.stdout.splitlines():
+                    match = re.match(r'(.+?):(\d+):(\d+):\s*(warning|error|note):\s*(.+)', line)
+                    if match:
+                        file_path, line_num, col, level, msg = match.groups()
+                        rel_path = os.path.relpath(file_path, repo_path)
+                        severity = "HIGH" if level == "error" else "MEDIUM"
+
+                        self.findings.append(Finding(
+                            id=f"CLANGTIDY-{hashlib.md5(f'{rel_path}:{line_num}'.encode()).hexdigest()[:8]}",
+                            title=f"Clang-Tidy : {msg[:60]}",
+                            severity=severity, category="SAST",
+                            file_path=rel_path, line_number=int(line_num),
+                            code_snippet=msg[:200], description=msg,
+                            source_tool="clang-tidy",
+                            remediation="Corriger selon les recommandations Clang-Tidy."
+                        ))
+            except subprocess.TimeoutExpired:
+                logger.debug(f"Clang-Tidy timeout sur {cpp_file}")
+            except Exception as e:
+                logger.debug(f"Clang-Tidy erreur : {e}")
+
+        logger.info(f"  → {len(self.findings)} finding(s) Clang-Tidy cumulés")
