@@ -300,4 +300,23 @@ Héritier du protocole NEXUS. Architecte du système.
 <div align="center"><svg width="600" height="40" viewBox="0 0 600 40" xmlns="http://www.w3.org/2000/svg"> <defs> <linearGradient id="endGrad" x1="0%" y1="0%" x2="100%" y2="0%"> <stop offset="0%" stop-color="#00ff88" stop-opacity="0"/> <stop offset="50%" stop-color="#00ff88" stop-opacity="1"/> <stop offset="100%" stop-color="#00ff88" stop-opacity="0"/> </linearGradient> </defs> <line x1="0" y1="20" x2="600" y2="20" stroke="url(#endGrad)" stroke-width="2"/> <text x="300" y="28" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" fill="#8b9dc3" font-style="italic"> « Ce qui est vérifié ne se cache pas. » <animate attributeName="opacity" values="0.4;1;0.4" dur="4s" repeatCount="indefinite"/> </text> </svg>
 
 Made with 🧬 by Aissa Mohammedi (DGK) · 2026 · NEXUS OPEN SOURCE
-</div> ```
+</div> ```### Analyse SAST
+
+| Moteur | Langages couverts |
+|--------|-------------------|
+| Semgrep | Python, JavaScript, Java, Go, Ruby, PHP, C, C++ |
+| Bandit | Python uniquement |
+| **SpotBugs** | **Java (bytecode)** |
+| **PMD** | **Java (source)** |
+| Custom rules | Tous (via regex et patterns) |
+| Outil | Version minimale | Rôle |
+|-------|------------------|------|
+| Python | 3.10+ | Runtime principal |
+| Git | 2.30+ | Clonage des dépôts |
+| Semgrep | 1.50+ | SAST multi-langages |
+| Trivy | 0.40+ | Scan de vulnérabilités |
+| Gitleaks | 8.0+ | Détection de secrets |
+| Bandit | 1.7+ | Sécurité Python |
+| **SpotBugs** | **4.7+** | **Sécurité Java (bytecode)** |
+| **PMD** | **6.50+** | **Qualité Java (source)** |
+
