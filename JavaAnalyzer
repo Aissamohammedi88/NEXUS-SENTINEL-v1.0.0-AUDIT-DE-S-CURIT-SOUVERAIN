@@ -1,0 +1,198 @@
+# ==============================================================================
+# SECTION 9.5 : MODULE 4.5 — ANALYSE JAVA (SpotBugs + PMD)
+# ==============================================================================
+
+class JavaAnalyzer:
+    """Analyse statique pour le code Java via SpotBugs et PMD."""
+
+    def __init__(self):
+        self.findings: List[Finding] = []
+
+    def analyze(self, repo_path: str, metadata: Dict[str, Any]) -> List[Finding]:
+        """Lance l'analyse sur les fichiers Java détectés."""
+        if "java" not in metadata.get("languages", {}):
+            logger.info("Pas de fichiers Java détectés, skip de l'analyse Java.")
+            return []
+
+        logger.info("☕ Analyse du code Java...")
+        self.findings = []
+
+        # 1. SpotBugs (Bytecode analysis - nécessite la compilation)
+        if self._is_tool_available(SentinelConfig.SPOTBUGS_CMD):
+            self._run_spotbugs(repo_path)
+        else:
+            logger.warning("SpotBugs non disponible (installer : apt install spotbugs)")
+
+        # 2. PMD (Source code analysis - pas besoin de compiler)
+        if self._is_tool_available(SentinelConfig.PMD_CMD):
+            self._run_pmd(repo_path)
+        else:
+            logger.warning("PMD non disponible (installer : apt install pmd)")
+
+        logger.info(f"📊 Java : {len(self.findings)} finding(s) détecté(s)")
+        return self.findings
+
+    def _is_tool_available(self, tool: str) -> bool:
+        try:
+            subprocess.run([tool, "-version"], capture_output=True, timeout=5)
+            return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    def _run_spotbugs(self, repo_path: str):
+        """Lance SpotBugs (nécessite des fichiers .class compilés)."""
+        logger.info(" → SpotBugs en cours (analyse bytecode)...")
+        
+        # SpotBugs nécessite des fichiers compilés (.jar ou .class)
+        # On cherche d'abord un fichier pom.xml ou build.gradle pour compiler
+        pom_path = os.path.join(repo_path, "pom.xml")
+        gradle_path = os.path.join(repo_path, "build.gradle")
+        
+        if not (os.path.exists(pom_path) or os.path.exists(gradle_path)):
+            logger.warning("Aucun build system Java (Maven/Gradle) détecté. SpotBugs nécessite des classes compilées.")
+            return
+
+        # Compilation rapide (si Maven)
+        if os.path.exists(pom_path):
+            logger.info("  → Compilation via Maven...")
+            try:
+                subprocess.run(["mvn", "compile", "-q", "-DskipTests"], 
+                             cwd=repo_path, capture_output=True, timeout=300)
+            except Exception as e:
+                logger.warning(f"Échec compilation Maven : {e}")
+                return
+
+        # Lancer SpotBugs sur le répertoire target/classes
+        target_classes = os.path.join(repo_path, "target", "classes")
+        if not os.path.exists(target_classes):
+            logger.warning("Répertoire target/classes introuvable après compilation.")
+            return
+
+        try:
+            cmd = [
+                SentinelConfig.SPOTBUGS_CMD,
+                "-xml:withMessages",
+                "-output", "/tmp/spotbugs-report.xml",
+                target_classes
+            ]
+            subprocess.run(cmd, capture_output=True, timeout=SentinelConfig.TIMEOUT)
+
+            if os.path.exists("/tmp/spotbugs-report.xml"):
+                self._parse_spotbugs_report("/tmp/spotbugs-report.xml", repo_path)
+        except subprocess.TimeoutExpired:
+            logger.warning("SpotBugs : timeout")
+        except Exception as e:
+            logger.debug(f"SpotBugs erreur : {e}")
+
+    def _parse_spotbugs_report(self, xml_path: str, repo_path: str):
+        """Parse le rapport XML de SpotBugs."""
+        try:
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+
+            for bug in root.findall(".//BugInstance"):
+                bug_type = bug.get("type", "UNKNOWN")
+                priority = bug.get("priority", "3")
+                
+                # Map priority to severity
+                severity_map = {"1": "HIGH", "2": "MEDIUM", "3": "LOW"}
+                severity = severity_map.get(priority, "MEDIUM")
+
+                # Extract location
+                source_line = bug.find(".//SourceLine")
+                file_path = source_line.get("sourcepath", "unknown") if source_line is not None else "unknown"
+                line_num = int(source_line.get("start", 0)) if source_line is not None else 0
+
+                # Extract class/method
+                class_elem = bug.find(".//Class")
+                class_name = class_elem.get("classname", "") if class_elem is not None else ""
+
+                finding = Finding(
+                    id=f"SPOTBUGS-{bug_type}-{hashlib.md5(class_name.encode()).hexdigest()[:6]}",
+                    title=f"SpotBugs : {bug_type}",
+                    severity=severity,
+                    category="SAST",
+                    file_path=file_path,
+                    line_number=line_num,
+                    code_snippet=class_name,
+                    description=f"Bug pattern détecté par SpotBugs : {bug_type} (priorité {priority})",
+                    source_tool="spotbugs",
+                    remediation="Corriger selon les recommandations SpotBugs."
+                )
+                self.findings.append(finding)
+
+            logger.info(f"  → {len(root.findall('.//BugInstance'))} bug(s) SpotBugs détecté(s)")
+        except Exception as e:
+            logger.debug(f"Erreur parsing SpotBugs : {e}")
+
+    def _run_pmd(self, repo_path: str):
+        """Lance PMD (analyse du code source sans compilation)."""
+        logger.info(" → PMD en cours (analyse source)...")
+        
+        # Chercher les fichiers Java
+        java_files = []
+        for root, dirs, files in os.walk(repo_path, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in [
+                '.git', 'node_modules', 'target', 'build', '.m2'
+            ]]
+            for file in files:
+                if file.endswith('.java'):
+                    java_files.append(os.path.join(root, file))
+
+        if not java_files:
+            logger.warning("Aucun fichier .java trouvé pour PMD.")
+            return
+
+        logger.info(f"  → {len(java_files)} fichier(s) Java à analyser")
+
+        try:
+            # PMD 6+
+            cmd = [
+                SentinelConfig.PMD_CMD,
+                "check",
+                "-d", repo_path,
+                "-R", "category/java/bestpractices.xml,category/java/errorprone.xml,category/java/security.xml",
+                "-f", "text",
+                "-t", "3"
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=SentinelConfig.TIMEOUT
+            )
+
+            # Parser la sortie texte
+            for line in result.stdout.splitlines():
+                # Format: /path/to/File.java:line: rule_name: message
+                match = re.match(r'(.+?\.java):(\d+):\s*(\w+):\s*(.+)', line)
+                if match:
+                    file_path, line_num, rule, msg = match.groups()
+                    rel_path = os.path.relpath(file_path, repo_path)
+
+                    # Map PMD rules to severity
+                    severity = "MEDIUM"
+                    if "security" in rule.lower() or "password" in msg.lower():
+                        severity = "HIGH"
+                    elif "errorprone" in rule.lower():
+                        severity = "HIGH"
+
+                    finding = Finding(
+                        id=f"PMD-{rule}-{hashlib.md5(line.encode()).hexdigest()[:6]}",
+                        title=f"PMD : {rule}",
+                        severity=severity,
+                        category="SAST",
+                        file_path=rel_path,
+                        line_number=int(line_num),
+                        code_snippet=msg[:200],
+                        description=msg,
+                        source_tool="pmd",
+                        remediation="Corriger selon les recommandations PMD."
+                    )
+                    self.findings.append(finding)
+
+            logger.info(f"  → {len(self.findings)} finding(s) PMD détecté(s)")
+        except subprocess.TimeoutExpired:
+            logger.warning("PMD : timeout")
+        except FileNotFoundError:
+            logger.warning("PMD commande 'pmd' introuvable, essayer 'pmd-bin'.")
+        except Exception as e:
+            logger.debug(f"PMD erreur : {e}")
