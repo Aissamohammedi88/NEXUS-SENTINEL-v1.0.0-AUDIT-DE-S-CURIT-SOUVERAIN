@@ -1,18 +1,118 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEXUS-SENTINEL — .gitignore
+# Auteur : Aissa Mohammedi (DGK) — NEXUS-OPEN-3.0
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# Other files and folders
-.settings/
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
 
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
+# --- Environnements virtuels ---
+.venv/
+venv/
+ENV/
+env/
+pythonenv/
+.conda/
+pyvenv.cfg
 
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+# --- Tests & coverage ---
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.dmypy.json
+dmypy.json
+
+# --- Sortie d'audit (générés à l'exécution) ---
+sentinel_logs/
+sentinel_workspace/
+sentinel_audit.db
+sentinel_rules/
+sentinel_report_*.json
+sentinel_report_*.md
+sentinel_report_*.html
+audit-report.txt
+*.sarif
+
+# --- Secrets & config locale ---
+.env
+.env.local
+.env.*.local
+secrets.json
+config.local.json
+*.pem
+*.key
+*.crt
+credentials.json
+gitleaks-report.json
+
+# --- Cache temporaire ---
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.pid
+*.log
+
+# --- IDE ---
+.vscode/
+.vscode/*
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+.fleet/
+.nvim/
+*.sublime-project
+*.sublime-workspace
+
+# --- OS ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.fuse_hidden*
+.Trash-*
+
+# --- NEXUS spécifique ---
+.nexus/
+nexus_state.json
+nexus_cache/
+nexus_data/
+nexus_*.log
