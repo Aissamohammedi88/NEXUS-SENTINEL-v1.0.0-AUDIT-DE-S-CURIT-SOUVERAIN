@@ -1,0 +1,34 @@
+def _analyze_structure(self, path: str) -> Dict[str, Any]:
+    stats = {"total_files": 0, "code_files": 0, "languages": {}, "workflows": [],
+             "total_size": 0, "has_dependencies": False, "dependency_files": []}
+
+    max_size = SentinelConfig.MAX_REPO_SIZE
+
+    for root, dirs, files in os.walk(path, followlinks=False):
+        dirs[:] = [d for d in dirs if d not in [
+            '.git', 'node_modules', 'venv', '__pycache__', 'dist', 'build',
+            '.tox', 'target', 'vendor'
+        ]]
+        
+        for file in files:
+            file_path = os.path.join(root, file)
+            
+            # Skip symlinks
+            if os.path.islink(file_path):
+                logger.debug(f"Skip symlink : {file_path}")
+                continue
+            
+            try:
+                size = os.path.getsize(file_path)
+            except OSError:
+                continue
+            
+            # Vérifier la limite globale
+            if stats["total_size"] + size > max_size:
+                logger.warning(f"Limite de {max_size} octets atteinte, arrêt du scan.")
+                return stats
+            
+            stats["total_size"] += size
+            # ... reste du code
+            
+    return stats
