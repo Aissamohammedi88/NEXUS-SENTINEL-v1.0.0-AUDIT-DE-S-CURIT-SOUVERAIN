@@ -1,0 +1,12 @@
+# Dans main(), remplace :
+if args.command == "audit":
+    orchestrator.audit(args.target, args.format)
+
+# Par :
+if args.command == "setup":
+    install_system_dependencies()
+    install_python_dependencies()
+    print("✅ Dépendances vérifiées et installées.")
+    return
+
+# Et retire les appels auto-install du début de main()
