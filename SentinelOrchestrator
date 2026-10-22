@@ -1,0 +1,31 @@
+class SentinelOrchestrator:
+    """Orchestrateur principal de l'audit."""
+
+    def __init__(self):
+        self.ingestor = Ingestor()
+        self.sast = SastAnalyzer()
+        self.workflow = WorkflowAnalyzer()
+        self.deps = DependencyAnalyzer()
+        self.java = JavaAnalyzer()  # <-- AJOUT
+        self.crosschecker = CrossChecker()
+        self.report_gen = ReportGenerator()
+        self.db = SentinelDatabase()
+
+    def audit(self, target: str, output_format: str = "all") -> AuditReport:
+        # ... code existant ...
+
+        try:
+            # Phase 1 : Ingestion
+            repo_path, metadata = self.ingestor.ingest(target)
+
+            # Phase 2 : Analyse SAST
+            findings.extend(self.sast.analyze(repo_path, metadata))
+
+            # Phase 2.5 : Analyse Java (SpotBugs + PMD)
+            findings.extend(self.java.analyze(repo_path, metadata))  # <-- AJOUT
+
+            # Phase 3 : Analyse des workflows
+            if metadata.get("workflows"):
+                findings.extend(self.workflow.analyze(repo_path, metadata["workflows"]))
+
+            # ... reste inchangé ...
