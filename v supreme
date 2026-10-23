@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+NEXUS SENTINEL v2.0.2 — Audit souverain · local · temps réel
+Auteur : Aissa Mohammedi (DGK)
+Licence : NEXUS-OPEN-3.0
+"""
+
+import sys
+import os
+import re
+import json
+import math
+import time
+import uuid
+import queue
+import shutil
+import socket
+import sqlite3
+import hashlib
+import logging
+import argparse
+import threading
+import subprocess
+import traceback
+import urllib.parse
+from pathlib import Path
+from datetime import datetime
+from dataclasses import dataclass, field, asdict
+from logging.handlers import RotatingFileHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+VERSION = "2.0.2"
+AUTEUR = "Aissa Mohammedi (DGK)"
+LICENCE = "NEXUS-OPEN-3.0"
+HOST = "127.0.0.1"
+PORT = 9992
+
+HOME = Path(os.path.expanduser("~"))
+BASES = [
+    HOME / "Documents" / "nexus_sentinel",
+    HOME / "nexus_sentinel",
+    Path("/tmp/nexus_sentinel"),
+    Path.cwd() / "nexus_sentinel",
+]
+BASE = None
+for _b in BASES:
+    try:
+        _b.mkdir(parents=True, exist_ok=True)
+        (_b / ".wt").write_text("ok")
+        (_b / ".wt").unlink()
+        BASE = _b
+        break
+    except Exception:
+        continue
+if BASE is None:
+    BASE = Path.cwd()
+
+WORKSPACE = BASE / "workspace"
+LOG_DIR = BASE / "logs"
+DB_FILE = BASE / "sentinel.db"
+WORKSPACE.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+MAX_FILE_SIZE = 5 * 1024 * 1024
+SCAN_TIMEOUT = 300
+SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__',
+             "dist", "build", ".next", "target", ".pytest_cache", "vendor"}
+
+CODE_EXT = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript",
+    ".jsx": "javascript", ".tsx": "typescript", ".java": "java",
+    ".go": "go", ".rb": "ruby", ".php": "php", ".c": "c", ".h": "c",
+    ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp", ".cs": "csharp",
+    ".rs": "rust", ".swift": "swift", ".kt": "kotlin", ".sh": "bash",
+    ".yml": "yaml", ".yaml": "yaml", ".json": "json", ".sql": "sql", ".env": "env",
+}
+
+DEP_FILES = {
+    "requirements.txt", "Pipfile", "pyproject.toml",
+    "package.json", "yarn.lock", "package-lock.json",
+    "Gemfile", "Gemfile.lock", "go.mod", "go.sum",
+    "pom.xml", "build.gradle", "Cargo.toml", "Cargo.lock",
+}
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+
+def setup_logging():
+    logger = logging.getLogger("NEXUS_SENTINEL")
+    logger.setLevel(logging.DEBUG)
+    if logger.handlers:
+        return logger
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+    fh = RotatingFileHandler(str(LOG_DIR / "sentinel.log"), maxBytes=10*1024*1024, backupCount=3)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger
+
+logger = setup_logging()
+
+# ============================================================================
+# PATTERNS DE DÉTECTION
+# ============================================================================
+
+SECRET_PATTERNS = {
+    "AWS_ACCESS_KEY": (re.compile(r"AKIA[0-9A-Z]{16}"), "CRITICAL"),
+    "AWS_SECRET_KEY": (re.compile(r"aws_secret_access_key\s*[=:]\s*['\"]?([A-Za-z0-9/+=]{40})"), "CRITICAL"),
+    "GITHUB_TOKEN": (re.compile(r"gh[pousr]_[A-Za-z0-9_]{36,}"), "CRITICAL"),
+    "GITLAB_TOKEN": (re.compile(r"glpat-[A-Za-z0-9_\-]{20,}"), "CRITICAL"),
+    "SLACK_TOKEN": (re.compile(r"xox[baprs]-[0-9A-Za-z\-]{10,}"), "HIGH"),
+    "PRIVATE_KEY": (re.compile(r"-----BEGIN (RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----"), "CRITICAL"),
+    "GOOGLE_API_KEY": (re.compile(r"AIza[0-9A-Za-z_\-]{35}"), "HIGH"),
+    "STRIPE_LIVE": (re.compile(r"sk_live_[0-9a-zA-Z]{24,}"), "CRITICAL"),
+    "STRIPE_TEST": (re.compile(r"sk_test_[0-9a-zA-Z]{24,}"), "MEDIUM"),
+    "JWT": (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "MEDIUM"),
+    "PASSWORD_LITERAL": (re.compile(r"(?i)(password|passwd|pwd)\s*[=:]\s*['\"][^'\"]{8,}['\"]"), "HIGH"),
+    "DB_CONN": (re.compile(r"(?:postgres|mysql|mongodb|redis)(?:ql)?://[^\s'\"]+"), "HIGH"),
+    "OPENAI_KEY": (re.compile(r"sk-[A-Za-z0-9]{20,}"), "CRITICAL"),
+    "HUGGINGFACE": (re.compile(r"hf_[A-Za-z0-9]{30,}"), "HIGH"),
+}
+
+CODE_ANTIPATTERNS = {
+    "EVAL_USAGE": (re.compile(r"\beval\s*\("), "HIGH", "Exécution de code dynamique via eval()"),
+    "EXEC_USAGE": (re.compile(r"\bexec\s*\("), "MEDIUM", "Exécution de commandes via exec()"),
+    "OS_SYSTEM": (re.compile(r"\bos\.system\s*\("), "HIGH", "Shell injection possible"),
+    "SUBPROCESS_SHELL": (re.compile(r"subprocess\.(?:run|call|Popen)[^)]*shell\s*=\s*True"), "HIGH", "Shell=True"),
+    "PICKLE_LOAD": (re.compile(r"pickle\.loads?\s*\("), "HIGH", "Désérialisation non sûre"),
+    "YAML_UNSAFE": (re.compile(r"yaml\.load\s*\([^,)]*\)"), "MEDIUM", "yaml.load sans SafeLoader"),
+    "SQL_STRING": (re.compile(r"(?:execute|query)\s*\(\s*['\"][^'\"]*%\s*\("), "HIGH", "SQL concaténée"),
+    "MD5_HASH": (re.compile(r"hashlib\.md5\s*\("), "MEDIUM", "MD5 cassé"),
+    "SHA1_HASH": (re.compile(r"hashlib\.sha1\s*\("), "MEDIUM", "SHA-1 faible"),
+    "RANDOM_SECRET": (re.compile(r"random\.(random|randint|choice)\s*\("), "MEDIUM", "random non crypto"),
+    "DEBUG_TRUE": (re.compile(r"debug\s*[=:]\s*[Tt]rue"), "MEDIUM", "Debug activé"),
+    "VERIFY_FALSE": (re.compile(r"verify\s*=\s*False"), "HIGH", "SSL verification désactivée"),
+}
+
+WORKFLOW_PATTERNS = {
+    "CMD_INJECTION": (re.compile(r"\$\{\{\s*github\.event\.(?:issue|pull_request|comment)\.[a-z_.]+\s*\}\}"), "CRITICAL", "Injection commande"),
+    "PR_TARGET": (re.compile(r"pull_request_target"), "HIGH", "pull_request_target"),
+    "UNPINNED_ACTION": (re.compile(r"uses\s*:\s*[a-zA-Z0-9_\-\.]+@(?:main|master|v\d+)\b"), "MEDIUM", "Action non pinée"),
+}
+
+LICENSE_BAD = {
+    "GPL-3.0": "Copyleft fort",
+    "AGPL-3.0": "Copyleft réseau SaaS",
+    "SSPL": "Non-OSI",
+}
+
+# ============================================================================
+# STRUCTURES DE DONNÉES
+# ============================================================================
+
+@dataclass
+class Finding:
+    id: str
+    title: str
+    severity: str
+    category: str
+    file_path: str = ""
+    line_number: int = 0
+    code_snippet: str = ""
+    description: str = ""
+    remediation: str = ""
+    source_tool: str = "nexus"
+
+    def to_dict(self):
+        return asdict(self)
+
+@dataclass
+class AuditReport:
+    id: str
+    target: str
+    started_at: str
+    finished_at: str = ""
+    duration_s: float = 0.0
+    files_scanned: int = 0
+    findings: list = field(default_factory=list)
+    stats: dict = field(default_factory=dict)
+    risk_score: float = 0.0
+    risk_level: str = ""
+    errors: list = field(default_factory=list)
+    status: str = "running"
+
+    def to_dict(self):
+        return {
+            "id": self.id, "target": self.target, "started_at": self.started_at,
+            "finished_at": self.finished_at, "duration_s": round(self.duration_s, 2),
+            "files_scanned": self.files_scanned,
+            "findings": [f.to_dict() for f in self.findings],
+            "stats": self.stats, "risk_score": round(self.risk_score, 2),
+            "risk_level": self.risk_level, "errors": self.errors,
+            "status": self.status,
+        }
+
+# ============================================================================
+# FONCTIONS UTILITAIRES
+# ============================================================================
+
+def shannon_entropy(s):
+    if not s: return 0.0
+    counts = {}
+    for c in s: counts[c] = counts.get(c, 0) + 1
+    n = len(s)
+    return sum(-((cnt/n) * math.log2(cnt/n)) for cnt in counts.values())
+
+def extract_high_entropy_tokens(content, min_len=20, max_tokens=5):
+    if len(content) > 500_000: content = content[:500_000]
+    tokens = re.findall(r"[A-Za-z0-9+/=_\-]{%d,}" % min_len, content)
+    hits, seen = [], set()
+    for tok in tokens:
+        if tok in seen: continue
+        seen.add(tok)
+        if len(tok) >= min_len and shannon_entropy(tok) >= 4.2:
+            hits.append(tok)
+            if len(hits) >= max_tokens: break
+    return hits
+
+# ============================================================================
+# MOTEURS D'ANALYSE
+# ============================================================================
+
+class EngineBase:
+    name = "base"
+    def scan_file(self, rel_path, abs_path, content): return []
+    def scan_meta(self, repo_path, metadata): return []
+    def available(self): return True
+
+class SecretsEngine(EngineBase):
+    name = "secrets"
+    def scan_file(self, rel_path, abs_path, content):
+        findings = []
+        for i, line in enumerate(content.splitlines(), 1):
+            for pid, (pat, sev) in SECRET_PATTERNS.items():
+                m = pat.search(line)
+                if m:
+                    masked = m.group(0)[:6] + "..." + m.group(0)[-4:] if len(m.group(0)) > 12 else m.group(0)
+                    findings.append(Finding(
+                        id=f"SEC-{pid}", title=f"Secret possible : {pid}",
+                        severity=sev, category="SECRETS", file_path=rel_path,
+                        line_number=i, code_snippet=masked,
+                        description=f"Pattern {pid} détecté.",
+                        remediation="Révoquer le secret, utiliser un vault.",
+                        source_tool="nexus.secrets",
+                    ))
+        for tok in extract_high_entropy_tokens(content):
+            idx = content.find(tok)
+            findings.append(Finding(
+                id="SEC-ENTROPY", title="Token haute entropie",
+                severity="MEDIUM", category="SECRETS", file_path=rel_path,
+                line_number=content[:idx].count("\n") + 1,
+                code_snippet=tok[:6] + "..." + tok[-4:],
+                description=f"Entropie: {shannon_entropy(tok):.2f} bits/char",
+                remediation="Vérifier manuellement.",
+                source_tool="nexus.entropy",
+            ))
+        return findings
+
+class CodeEngine(EngineBase):
+    name = "code"
+    FIXES = {
+        "EVAL_USAGE": "Utiliser ast.literal_eval",
+        "OS_SYSTEM": "Subprocess avec liste d'args",
+        "SQL_STRING": "Utiliser des placeholders",
+        "MD5_HASH": "Passer à sha256",
+        "RANDOM_SECRET": "Utiliser secrets.token_*()",
+    }
+    def scan_file(self, rel_path, abs_path, content):
+        findings = []
+        for i, line in enumerate(content.splitlines(), 1):
+            for pid, (pat, sev, desc) in CODE_ANTIPATTERNS.items():
+                if pat.search(line):
+                    findings.append(Finding(
+                        id=f"CODE-{pid}", title=pid, severity=sev,
+                        category="CODE", file_path=rel_path, line_number=i,
+                        code_snippet=line.strip()[:200], description=desc,
+                        remediation=self.FIXES.get(pid, "Corriger"),
+                        source_tool="nexus.code",
+                    ))
+        return findings
+
+class WorkflowEngine(EngineBase):
+    name = "workflow"
+    def scan_file(self, rel_path, abs_path, content):
+        if ".github/workflows/" not in rel_path.replace("\\", "/"): return []
+        findings = []
+        for i, line in enumerate(content.splitlines(), 1):
+            for pid, (pat, sev, desc) in WORKFLOW_PATTERNS.items():
+                if pat.search(line):
+                    findings.append(Finding(
+                        id=f"WF-{pid}", title=pid, severity=sev,
+                        category="WORKFLOW", file_path=rel_path, line_number=i,
+                        code_snippet=line.strip()[:200], description=desc,
+                        remediation="Voir GitHub Actions security hardening.",
+                        source_tool="nexus.workflow",
+                    ))
+        return findings
+
+class DependencyEngine(EngineBase):
+    name = "dependencies"
+    def scan_file(self, rel_path, abs_path, content):
+        fname = os.path.basename(rel_path)
+        if fname not in DEP_FILES: return []
+        findings = []
+        if fname == "requirements.txt":
+            for i, line in enumerate(content.splitlines(), 1):
+                s = line.strip()
+                if s and not s.startswith("#") and "==" not in s:
+                    findings.append(Finding(
+                        id="DEP-UNPINNED", title="Dépendance non pinée",
+                        severity="MEDIUM", category="DEPENDENCIES",
+                        file_path=rel_path, line_number=i, code_snippet=s[:120],
+                        description="Risque supply chain",
+                        remediation="Fixer la version (==X.Y.Z)",
+                        source_tool="nexus.deps",
+                    ))
+        return findings
+
+class LicenseEngine(EngineBase):
+    name = "license"
+    def scan_file(self, rel_path, abs_path, content):
+        if not os.path.basename(rel_path).upper().startswith("LICENSE"): return []
+        findings = []
+        for lic, note in LICENSE_BAD.items():
+            if lic.lower() in content.lower():
+                findings.append(Finding(
+                    id=f"LIC-{lic.replace('-','_')}", title=f"Licence: {lic}",
+                    severity="LOW", category="LICENSE", file_path=rel_path,
+                    code_snippet=lic, description=note,
+                    remediation="Vérifier compatibilité",
+                    source_tool="nexus.license",
+                ))
+        return findings
+
+# ============================================================================
+# ORCHESTRATEUR
+# ============================================================================
+
+class AuditEngine:
+    def __init__(self):
+        self.engines = [
+            SecretsEngine(), CodeEngine(), WorkflowEngine(),
+            DependencyEngine(), LicenseEngine(),
+        ]
+
+    def ingest(self, target, job_id):
+        name = os.path.basename(target.rstrip("/").replace(".git", "")) or "repo"
+        safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)[:40]
+        dst = WORKSPACE / (safe_name + "_" + job_id)
+        if dst.exists(): shutil.rmtree(dst, ignore_errors=True)
+        if os.path.isdir(target):
+            shutil.copytree(target, dst, symlinks=True,
+                          ignore=shutil.ignore_patterns(*SKIP_DIRS))
+            return dst, {"source_type": "local"}
+        raise ValueError(f"Cible invalide: {target}")
+
+    def walk_files(self, repo_path):
+        for root, dirs, files in os.walk(repo_path):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for f in files:
+                fp = Path(root) / f
+                try:
+                    if fp.stat().st_size > MAX_FILE_SIZE: continue
+                except OSError: continue
+                ext = fp.suffix.lower()
+                if ext in CODE_EXT or f in DEP_FILES or "LICENSE" in f.upper():
+                    yield fp
+
+    def audit(self, target, progress_cb=None):
+        report = AuditReport(id=uuid.uuid4().hex[:12], target=target,
+                            started_at=datetime.now().isoformat())
+        t0 = time.time()
+        findings = []
+        try:
+            repo_path, meta = self.ingest(target, report.id)
+            report.metadata = meta
+            files = list(self.walk_files(repo_path))
+            total = len(files) or 1
+            for i, fp in enumerate(files, 1):
+                try:
+                    rel = str(fp.relative_to(repo_path))
+                    content = fp.read_text(encoding="utf-8", errors="ignore")
+                    report.files_scanned += 1
+                    for engine in self.engines:
+                        findings.extend(engine.scan_file(rel, str(fp), content))
+                except Exception as e:
+                    report.errors.append(str(e)[:100])
+                if progress_cb and i % 10 == 0:
+                    progress_cb("scan", int(i/total*80), f"Scanné {i}/{total}")
+        except Exception as e:
+            report.errors.append(str(e)[:300])
+        
+        findings = self._dedup(findings)
+        sev_order = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2}
+        findings.sort(key=lambda x: -sev_order.get(x.severity, 0))
+        stats = {}
+        for f in findings: stats[f.severity] = stats.get(f.severity, 0) + 1
+        weights = {"CRITICAL": 10, "HIGH": 5, "MEDIUM": 2, "LOW": 0.5}
+        raw = sum(weights.get(f.severity, 0) for f in findings)
+        risk = min(100.0, math.sqrt(raw) * 5) if raw > 0 else 0.0
+        report.findings, report.stats, report.risk_score = findings, stats, risk
+        report.risk_level = "CRITICAL" if risk >= 75 else "HIGH" if risk >= 50 else "MEDIUM" if risk >= 25 else "LOW" if risk > 0 else "NONE"
+        report.finished_at, report.duration_s, report.status = datetime.now().isoformat(), time.time()-t0, "done"
+        return report
+
+    def _dedup(self, findings):
+        seen, order = {}, {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2}
+        for f in findings:
+            key = (f.file_path, f.line_number, f.category, f.title[:40])
+            if key not in seen or order.get(f.severity, 0) > order.get(seen[key].severity, 0):
+                seen[key] = f
+        return list(seen.values())
+
+# ============================================================================
+# BASE DE DONNÉES
+# ============================================================================
+
+class DB:
+    def __init__(self, path):
+        self.path, self.lock, self._conn = str(path), threading.RLock(), None
+        self._init()
+    
+    def _c(self):
+        if not self._conn:
+            self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        return self._conn
+    
+    def _init(self):
+        with self.lock:
+            c = self._c()
+            c.execute("""CREATE TABLE IF NOT EXISTS audits (
+                id TEXT PRIMARY KEY, target TEXT, started_at TEXT,
+                finished_at TEXT, duration_s REAL, files_scanned INTEGER,
+                total_findings INTEGER, risk_score REAL, risk_level TEXT,
+                status TEXT, report_json TEXT)""")
+            c.commit()
+    
+    def save(self, report):
+        with self.lock:
+            c = self._c()
+            d = report.to_dict()
+            c.execute("""INSERT OR REPLACE INTO audits VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (report.id, report.target, report.started_at, report.finished_at,
+                 report.duration_s, report.files_scanned, len(report.findings),
+                 report.risk_score, report.risk_level, report.status,
+                 json.dumps(d, ensure_ascii=False)))
+            c.commit()
+    
+    def get(self, audit_id):
+        with self.lock:
+            row = self._c().execute("SELECT report_json FROM audits WHERE id=?", (audit_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+    
+    def list_recent(self, limit=50):
+        with self.lock:
+            rows = self._c().execute("""SELECT id,target,started_at,duration_s,
+                total_findings,risk_score,risk_level,status FROM audits 
+                ORDER BY started_at DESC LIMIT ?""", (limit,)).fetchall()
+            return [{"id": r[0], "target": r[1], "started_at": r[2],
+                    "duration_s": r[3], "total_findings": r[4],
+                    "risk_score": r[5], "risk_level": r[6], "status": r[7]} for r in rows]
+
+DB_INSTANCE = DB(DB_FILE)
+
+# ============================================================================
+# JOB MANAGER
+# ============================================================================
+
+class JobManager:
+    def __init__(self):
+        self.lock, self.jobs, self.engine = threading.RLock(), {}, AuditEngine()
+    
+    def start(self, target):
+        job_id = uuid.uuid4().hex[:12]
+        job = {"id": job_id, "target": target, "started_at": datetime.now().isoformat(),
+               "progress": 0, "step": "queued", "message": "En attente",
+               "report": None, "queue": queue.Queue(), "done": False}
+        with self.lock: self.jobs[job_id] = job
+        def worker():
+            def progress_cb(step, pct, msg):
+                with self.lock: job.update({"step": step, "progress": pct, "message": msg})
+                try: job["queue"].put_nowait({"step": step, "progress": pct, "message": msg})
+                except queue.Full: pass
+            try:
+                report = self.engine.audit(target, progress_cb=progress_cb)
+                DB_INSTANCE.save(report)
+                with self.lock: job["report"] = report.to_dict()
+            except Exception as e:
+                with self.lock: job["message"] = "Erreur: " + str(e)[:200]
+            finally:
+                with self.lock: job["done"] = True
+            try: job["queue"].put_nowait({"step": "done", "progress": 100, "message": "Terminé"})
+            except queue.Full: pass
+        threading.Thread(target=worker, daemon=True).start()
+        return job_id
+    
+    def get(self, job_id):
+        with self.lock: return self.jobs.get(job_id)
+
+JOBS = JobManager()
+
+# ============================================================================
+# SERVER
+# ============================================================================
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = f"NexusSentinel/{VERSION}"
+    
+    def log_message(self, *a): pass
+    
+    def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None):
+        if isinstance(body, str): body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        if extra:
+            for k, v in extra.items(): self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+    
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj, ensure_ascii=False, default=str), "application/json")
+    
+    def _read_json(self):
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(n).decode()) if n else {}
+        except: return {}
+    
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        parts = [p for p in path.split("/") if p]
+        
+        if not parts or parts[0] == "index.html":
+            from html_template import render_html
+            return self._send(200, render_html())
+        
+        if parts[0] != "api": return self._json(404, {"error": "not found"})
+        
+        if len(parts) == 2:
+            if parts[1] == "health":
+                engines = JOBS.engine.engines
+                avail = sum(1 for e in engines if e.available())
+                return self._json(200, {"ok": True, "version": VERSION, "engines_available": avail})
+            if parts[1] == "audits": return self._json(200, {"audits": DB_INSTANCE.list_recent(50)})
+        
+        if len(parts) == 3 and parts[1] == "audit":
+            d = DB_INSTANCE.get(parts[2])
+            if not d: return self._json(404, {"error": "introuvable"})
+            kind = parts[2].split("/")[-1] if "/" in parts[2] else None
+            return self._json(200, d)
+        
+        if len(parts) >= 4 and parts[1] == "audit":
+            audit_id, kind = parts[2], parts[3]
+            d = DB_INSTANCE.get(audit_id)
+            if not d: return self._json(404, {"error": "introuvable"})
+            if kind == "json":
+                return self._send(200, json.dumps(d, indent=2, ensure_ascii=False), "application/json",
+                    {"Content-Disposition": f'attachment; filename="report_{audit_id}.json"'})
+            elif kind == "sarif":
+                sarif = {"version": "2.1.0", "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                        "runs": [{"tool": {"driver": {"name": "NEXUS-SENTINEL", "version": VERSION}},
+                                "results": [{"ruleId": f.get("id"), "level": "warning",
+                                            "message": {"text": f.get("description")},
+                                            "locations": [{"physicalLocation": {
+                                                "artifactLocation": {"uri": f.get("file_path")},
+                                                "region": {"startLine": max(1, int(f.get("line_number") or 0))}}}]
+                                            }] for f in d.get("findings", [])}]}
+                return self._send(200, json.dumps(sarif, indent=2), "application/json",
+                    {"Content-Disposition": f'attachment; filename="report_{audit_id}.sarif"'})
+            elif kind == "md":
+                md = f"# Audit {audit_id}\nCible: {d.get('target')}\nFindings: {len(d.get('findings', []))}\n"
+                return self._send(200, md, "text/markdown")
+        
+        if len(parts) == 3 and parts[1] == "stream":
+            return self._stream(parts[2])
+        
+        return self._json(404, {"error": "not found"})
+    
+    def do_POST(self):
+        if self.path == "/api/audit":
+            payload = self._read_json()
+            target = (payload.get("target") or "").strip()
+            if not target: return self._json(400, {"error": "target manquant"})
+            job_id = JOBS.start(target)
+            return self._json(200, {"job_id": job_id, "target": target})
+        return self._json(404, {"error": "not found"})
+    
+    def _stream(self, job_id):
+        job = JOBS.get(job_id)
+        if not job: return self._json(404, {"error": "introuvable"})
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            while True:
+                try:
+                    ev = job["queue"].get(timeout=2)
+                    data = {"type": "progress", **ev} if ev.get("step") != "done" else {"type": "done"}
+                    self.wfile.write(("data: " + json.dumps(data) + "\n\n").encode())
+                    self.wfile.flush()
+                    if ev.get("step") == "done": break
+                except queue.Empty:
+                    if job["done"]:
+                        self.wfile.write(b"data: {\"type\":\"done\"}\n\n")
+                        self.wfile.flush()
+                    break
+                self.wfile.write(b": ping\n\n")
+                self.wfile.flush()
+        except: pass
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except: return "localhost"
+
+def main():
+    print(f"\n{'='*70}\n NEXUS SENTINEL v{VERSION}\n Audit souverain local\n{'='*70}\n")
+    print(f"Auteur: {AUTEUR}\nPort: {PORT}\nLocal: http://{HOST}:{PORT}/\nRéseau: http://{get_local_ip()}:{PORT}/\n")
+    print("Ctrl+C pour arrêter\n")
+    logger.info(f"Démarrage Sentinel v{VERSION}")
+    Server((HOST, PORT), Handler).serve_forever()
+
+if __name__ == "__main__":
+    main()
