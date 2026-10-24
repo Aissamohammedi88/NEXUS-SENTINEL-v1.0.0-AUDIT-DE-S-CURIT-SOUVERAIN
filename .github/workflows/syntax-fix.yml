@@ -1,6 +1,5 @@
 # .github/workflows/syntax-fix.yml
 name: Syntax Auto-Fix
-
 on:
   push:
     branches: [main]
