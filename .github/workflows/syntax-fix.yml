@@ -1,0 +1,40 @@
+# .github/workflows/syntax-fix.yml
+name: Syntax Auto-Fix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install fixers
+        run: |
+          pip install ruff autopep8
+      - name: Auto-fix Python syntax
+        run: |
+          # Corrige les erreurs de syntaxe et de style
+          ruff check --fix-only . || true
+          ruff format . || true
+          autopep8 --in-place --aggressive --recursive . || true
+      - name: Validate YAML syntax
+        run: |
+          python3 -c "
+import yaml, sys
+for f in ['.github/workflows/*.yml']:
+    try:
+        yaml.safe_load(open(f))
+    except yaml.YAMLError as e:
+        print(f'YAML error in {f}: {e}')
+        sys.exit(1)
+"
+      - name: Commit fixes
+        uses: autofix-ci/action@v1
+        with:
+          commit-message: "chore: auto-fix syntax and formatting"
