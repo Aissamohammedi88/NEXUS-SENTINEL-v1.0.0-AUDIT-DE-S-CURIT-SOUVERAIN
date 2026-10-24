@@ -1,0 +1,49 @@
+# .github/workflows/dead-code.yml
+name: Dead Code Detection
+on:
+  schedule:
+    - cron: '0 4 1 * *'  # 1er du mois à 4h
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Analyze Production Logs
+        run: |
+          # Récupère les logs des 90 derniers jours depuis ton APM (Datadog, Sentry, etc.)
+          # Puis extrait les noms de fonctions/modules appelés
+          curl -s "${{ secrets.APM_API_URL }}/logs?from=90d" \
+            -H "Authorization: Bearer ${{ secrets.APM_TOKEN }}" \
+            | jq -r '.[].function_name' | sort -u > /tmp/called-functions.txt
+      - name: Detect Orphan Code
+        run: |
+          # Liste toutes les fonctions Python publiques
+          python3 << 'EOF'
+          import ast, pathlib
+          called = set(open('/tmp/called-functions.txt').read().splitlines())
+          orphans = []
+
+          for py_file in pathlib.Path('src').rglob('*.py'):
+              tree = ast.parse(py_file.read_text())
+              for node in ast.walk(tree):
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                      if not node.name.startswith('_') and node.name not in called:
+                          orphans.append(f"{py_file}:{node.lineno}:{node.name}")
+          with open('/tmp/orphans.txt', 'w') as f:
+              f.write('\n'.join(orphans))
+          print(f"Found {len(orphans)} orphan functions")
+          EOF
+      - name: Create Cleanup Issue
+        if: ${{ hashFiles('/tmp/orphans.txt') }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const orphans = require('fs').readFileSync('/tmp/orphans.txt', 'utf8');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🧹 Dead Code Candidates (${new Date().toISOString().slice(0,7)})`,
+              body: `Ces fonctions n'ont pas été appelées en production depuis 90 jours :\n\n\`\`\`\n${orphans}\n\`\`\`\n\nCandidat à l'archivage.`,
+              labels: ['dead-code', 'automated']
+            });
