@@ -1,11 +1,9 @@
 # .github/workflows/validate-workflows.yml
 name: Validate Workflows (Pydantic)
-
 on:
   pull_request:
     paths:
-      - '.github/workflows/**'
-
+    - '.github/workflows/**'
 jobs:
   validate:
     runs-on: ubuntu-latest
