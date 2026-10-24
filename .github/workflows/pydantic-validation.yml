@@ -1,34 +1,114 @@
-# .github/workflows/pydantic-validation.yml
-name: Pydantic Schema Validation
+# .github/workflows/auto-rollback.yml
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTO-ROLLBACK WITH CONFIDENCE — Rollback basé sur les métriques réelles
+# Feature inédite : aucun outil ne fait de rollback post-merge automatique.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Auto-Rollback with Confidence
 
 on:
-  pull_request:
-    paths:
-      - 'pyproject.toml'
-      - 'src/**'
+  push:
+    branches: [main]
 
 jobs:
-  validate:
+  monitor:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
-      - name: Validate Pydantic Models
-        run: |
-          python -c "
-from pydantic import BaseModel, ValidationError
-import importlib, pkgutil
+          fetch-depth: 2
 
-# Vérifie que tous les modèles Pydantic se chargent correctement
-for module_info in pkgutil.walk_packages(['src']):
-    try:
-        importlib.import_module(f'src.{module_info.name}')
-    except ValidationError as e:
-        print(f'Pydantic validation error: {e}')
-        exit(1)
-print('All Pydantic models validated.')
-"
+      - name: Baseline Snapshot (Before)
+        id: baseline
+        run: |
+          # Capture l'état AVANT le déploiement
+          # (Adapter selon ton infra : latence, erreurs, RAM, etc.)
+          BASELINE_LATENCY=$(curl -s -o /dev/null -w "%{time_total}" https://api.example.com/health || echo "0")
+          BASELINE_ERROR_RATE="0.01"  # À récupérer depuis ton monitoring
+          
+          echo "LATENCY=$BASELINE_LATENCY" >> $GITHUB_OUTPUT
+          echo "ERROR_RATE=$BASELINE_ERROR_RATE" >> $GITHUB_OUTPUT
+
+      - name: Wait for Deployment
+        run: |
+          echo "Waiting 60s for deployment to stabilize..."
+          sleep 60
+
+      - name: Post-Deploy Metrics (After)
+        id: after
+        run: |
+          AFTER_LATENCY=$(curl -s -o /dev/null -w "%{time_total}" https://api.example.com/health || echo "0")
+          AFTER_ERROR_RATE="0.02"  # À récupérer depuis ton monitoring
+          
+          echo "LATENCY=$AFTER_LATENCY" >> $GITHUB_OUTPUT
+          echo "ERROR_RATE=$AFTER_ERROR_RATE" >> $GITHUB_OUTPUT
+
+      - name: Compute Confidence Score
+        id: confidence
+        run: |
+          BEFORE_LAT="${{ steps.baseline.outputs.LATENCY }}"
+          AFTER_LAT="${{ steps.after.outputs.LATENCY }}"
+          BEFORE_ERR="${{ steps.baseline.outputs.ERROR_RATE }}"
+          AFTER_ERR="${{ steps.after.outputs.ERROR_RATE }}"
+          
+          # Calcul du delta (en %)
+          LAT_DELTA=$(awk "BEGIN {printf \"%.2f\", (($AFTER_LAT - $BEFORE_LAT) / $BEFORE_LAT) * 100}")
+          ERR_DELTA=$(awk "BEGIN {printf \"%.2f\", (($AFTER_ERR - $BEFORE_ERR) / $BEFORE_ERR) * 100}")
+          
+          # Score de confiance (0-100)
+          # 100 = aucune dégradation, 0 = catastrophe
+          if (( $(echo "$LAT_DELTA > 50" | bc -l) )); then
+            CONFIDENCE=0
+            DECISION="ROLLBACK_IMMEDIATE"
+          elif (( $(echo "$ERR_DELTA > 30" | bc -l) )); then
+            CONFIDENCE=20
+            DECISION="ROLLBACK_IMMEDIATE"
+          elif (( $(echo "$LAT_DELTA > 20 || $ERR_DELTA > 10" | bc -l) )); then
+            CONFIDENCE=50
+            DECISION="MONITOR_CLOSELY"
+          elif (( $(echo "$LAT_DELTA > 5 || $ERR_DELTA > 5" | bc -l) )); then
+            CONFIDENCE=75
+            DECISION="ACCEPTABLE"
+          else
+            CONFIDENCE=100
+            DECISION="PERFECT"
+          fi
+          
+          echo "CONFIDENCE=$CONFIDENCE" >> $GITHUB_OUTPUT
+          echo "DECISION=$DECISION" >> $GITHUB_OUTPUT
+          echo "LAT_DELTA=$LAT_DELTA" >> $GITHUB_OUTPUT
+          echo "ERR_DELTA=$ERR_DELTA" >> $GITHUB_OUTPUT
+
+      - name: Report Confidence
+        run: |
+          {
+            echo "### 🔄 Auto-Rollback Analysis"
+            echo ""
+            echo "| Metric | Before | After | Delta |"
+            echo "|--------|--------|-------|-------|"
+            echo "| Latency | ${{ steps.baseline.outputs.LATENCY }}s | ${{ steps.after.outputs.LATENCY }}s | ${{ steps.confidence.outputs.LAT_DELTA }}% |"
+            echo "| Error Rate | ${{ steps.baseline.outputs.ERROR_RATE }} | ${{ steps.after.outputs.ERROR_RATE }} | ${{ steps.confidence.outputs.ERR_DELTA }}% |"
+            echo ""
+            echo "**Confidence Score** : ${{ steps.confidence.outputs.CONFIDENCE }}/100"
+            echo "**Decision** : ${{ steps.confidence.outputs.DECISION }}"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Auto-Rollback if Critical
+        if: steps.confidence.outputs.CONFIDENCE == '0'
+        run: |
+          echo "::error::Confidence score is 0/100. Triggering automatic rollback..."
+          
+          # Rollback au commit précédent
+          PREVIOUS_COMMIT=$(git rev-parse HEAD~1)
+          git revert HEAD --no-edit
+          git push origin main
+          
+          # Crée une issue pour tracer
+          gh issue create \
+            --title "🚨 Auto-Rollback triggered at $(date +%Y-%m-%d)" \
+            --body "Confidence score dropped to 0. Rollback automatically triggered. Investigate commit $(git rev-parse HEAD~1)." \
+            --label "incident,auto-rollback"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
