@@ -1,0 +1,3 @@
+for f in .github/workflows/{blast-radius,failure-memory,consensus,predictive-tests,auto-rollback}.yml; do
+  python3 -c "import yaml; yaml.safe_load(open('$f'))" && echo "✓ $f"
+done
