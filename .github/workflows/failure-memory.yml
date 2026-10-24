@@ -1,0 +1,121 @@
+# .github/workflows/failure-memory.yml
+# ═══════════════════════════════════════════════════════════════════════════════
+# FAILURE MEMORY — Le système apprend de ses erreurs
+# Feature inédite : aucun outil ne maintient une mémoire des échecs.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Failure Memory
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+jobs:
+  learn:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+
+      - name: Download Failed Logs
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results
+          path: /tmp/failed-logs/ || echo "No artifacts"
+
+      - name: Extract Failure Signature
+        id: signature
+        run: |
+          # Extrait la signature unique de l'échec
+          LOG_FILE=$(find /tmp/failed-logs -name "*.log" 2>/dev/null | head -n 1)
+          
+          if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
+            # Extrait la ligne d'erreur principale
+            ERROR_LINE=$(grep -E "Error|FAILED|Exception" "$LOG_FILE" | head -n 1)
+            # Génère un hash de la signature
+            SIGNATURE=$(echo "$ERROR_LINE" | sha256sum | cut -c1-16)
+          else
+            ERROR_LINE="Unknown failure"
+            SIGNATURE="unknown_$(date +%s)"
+          fi
+          
+          echo "SIGNATURE=$SIGNATURE" >> $GITHUB_OUTPUT
+          echo "ERROR_LINE=$ERROR_LINE" >> $GITHUB_OUTPUT
+
+      - name: Update Failure Memory
+        run: |
+          MEMORY_FILE=".github/failure-memory.json"
+          
+          # Crée le fichier s'il n'existe pas
+          if [ ! -f "$MEMORY_FILE" ]; then
+            echo '{"failures": []}' > "$MEMORY_FILE"
+          fi
+          
+          # Ajoute l'échec à la mémoire
+          NEW_ENTRY=$(jq -n \
+            --arg sig "${{ steps.signature.outputs.SIGNATURE }}" \
+            --arg err "${{ steps.signature.outputs.ERROR_LINE }}" \
+            --arg branch "${{ github.event.workflow_run.head_branch }}" \
+            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              signature: $sig,
+              error: $err,
+              branch: $branch,
+              timestamp: $ts,
+              occurrence_count: 1
+            }')
+          
+          # Merge avec la mémoire existante
+          jq --argjson new "$NEW_ENTRY" '
+            .failures = (
+              (.failures // []) as $existing |
+              if ($existing | map(.signature) | index($new.signature)) then
+                $existing | map(
+                  if .signature == $new.signature 
+                  then .occurrence_count += 1 | .last_seen = $new.timestamp
+                  else . end
+                )
+              else
+                $existing + [$new]
+              end
+            )
+          ' "$MEMORY_FILE" > /tmp/updated_memory.json
+          
+          mv /tmp/updated_memory.json "$MEMORY_FILE"
+
+      - name: Commit Memory
+        run: |
+          git config user.name "Nexus Memory"
+          git config user.email "memory@nexus.local"
+          git add .github/failure-memory.json
+          git diff --quiet && git diff --staged --quiet || \
+            git commit -m "chore(memory): record failure signature ${{ steps.signature.outputs.SIGNATURE }}"
+          git push
+
+  check:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Against Known Failures
+        run: |
+          MEMORY_FILE=".github/failure-memory.json"
+          
+          if [ ! -f "$MEMORY_FILE" ]; then
+            echo "No failure memory yet. Nothing to check."
+            exit 0
+          fi
+
+          # Vérifie les patterns récurrents (> 3 occurrences)
+          RECURRING=$(jq -r '.failures[] | select(.occurrence_count >= 3) | .signature' "$MEMORY_FILE")
+          
+          if [ -n "$RECURRING" ]; then
+            echo "::warning::Failure patterns récurrents détectés : $RECURRING"
+            echo "Ces patterns ont échoué 3+ fois. Investiguer avant de merger."
+          fi
