@@ -1,0 +1,94 @@
+# .github/workflows/blast-radius.yml
+# ═══════════════════════════════════════════════════════════════════════════════
+# BLAST RADIUS ANALYSIS — Calcule l'impact réel d'une mise à jour
+# Feature inédite : aucun outil ne fait ça automatiquement.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Blast Radius Analysis
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect Changed Dependencies
+        id: changed
+        run: |
+          # Extrait les dépendances modifiées depuis pyproject.toml
+          git diff origin/main -- pyproject.toml requirements.txt 2>/dev/null | \
+            grep -E '^\+.*[a-zA-Z0-9_-]+\s*[=<>]' | \
+            sed 's/^+//' | awk '{print $1}' | sort -u > /tmp/changed_deps.txt || true
+          echo "CHANGED_DEPS<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/changed_deps.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Calculate Blast Radius
+        id: radius
+        run: |
+          TOTAL_IMPACT=0
+          > /tmp/blast-report.txt
+
+          while IFS= read -r dep; do
+            # Ignore les lignes vides
+            [ -z "$dep" ] && continue
+            
+            # Compte les fichiers qui importent cette dépendance
+            AFFECTED=$(grep -rIl "import $dep\|from $dep" --include="*.py" . 2>/dev/null | wc -l)
+            
+            if [ "$AFFECTED" -gt 0 ]; then
+              echo "- **$dep** : $AFFECTED fichier(s) impacté(s)" >> /tmp/blast-report.txt
+              TOTAL_IMPACT=$((TOTAL_IMPACT + AFFECTED))
+            fi
+          done < /tmp/changed_deps.txt
+
+          echo "TOTAL_IMPACT=$TOTAL_IMPACT" >> $GITHUB_OUTPUT
+
+      - name: Compute Risk Score
+        id: risk
+        run: |
+          IMPACT=${{ steps.radius.outputs.TOTAL_IMPACT }}
+          
+          # Calcul du score de risque (0-100)
+          if [ "$IMPACT" -eq 0 ]; then
+            RISK=0; LEVEL="🟢 FAIBLE"; ACTION="Auto-merge autorisé"
+          elif [ "$IMPACT" -le 5 ]; then
+            RISK=25; LEVEL="🟡 MODÉRÉ"; ACTION="Review rapide recommandée"
+          elif [ "$IMPACT" -le 20 ]; then
+            RISK=50; LEVEL="🟠 ÉLEVÉ"; ACTION="Tests d'intégration requis"
+          elif [ "$IMPACT" -le 50 ]; then
+            RISK=75; LEVEL="🔴 CRITIQUE"; ACTION="Review manuelle obligatoire"
+          else
+            RISK=100; LEVEL="⛔ EXTRÊME"; ACTION="Bloquer le merge"
+          fi
+          
+          echo "RISK=$RISK" >> $GITHUB_OUTPUT
+          echo "LEVEL=$LEVEL" >> $GITHUB_OUTPUT
+          echo "ACTION=$ACTION" >> $GITHUB_OUTPUT
+
+      - name: Publish Blast Radius Report
+        run: |
+          {
+            echo "### 💥 Blast Radius Analysis"
+            echo ""
+            echo "**Risk Score** : ${{ steps.risk.outputs.RISK }}/100 (${{ steps.risk.outputs.LEVEL }})"
+            echo "**Action requise** : ${{ steps.risk.outputs.ACTION }}"
+            echo ""
+            echo "#### Dépendances impactées"
+            cat /tmp/blast-report.txt 2>/dev/null || echo "_Aucune dépendance impactée_"
+            echo ""
+            echo "---"
+            echo "*Calculé par Nexus Prime Layer*"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Block Merge if Extreme Risk
+        if: steps.risk.outputs.RISK >= 100
+        run: |
+          echo "::error::Blast Radius trop élevé (${{ steps.risk.outputs.RISK }}/100). Merge bloqué automatiquement."
+          exit 1
