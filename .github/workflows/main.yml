@@ -1,0 +1,20 @@
+# .github/workflows/steward-auto-merge.yml
+name: Steward Auto-Merge
+on:
+  pull_request:
+    types: [labeled]
+jobs:
+  merge:
+    name: "⚙️ Steward — Safe Auto-Merge"
+    if: contains(github.event.pull_request.labels.*.name, 'automerge')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Status Checks
+        run: |
+          # Ne fusionne que si tous les checks sont verts
+          gh pr checks ${{ github.event.pull_request.number }} --watch
+      - name: Merge PR
+        run: gh pr merge --squash --auto ${{ github.event.pull_request.number }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
