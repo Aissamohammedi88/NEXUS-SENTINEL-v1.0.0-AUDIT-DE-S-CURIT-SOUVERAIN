@@ -1,0 +1,37 @@
+# .github/workflows/race-guard.yml
+name: Race Condition Guard
+
+on:
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  # Groupe de concurrence unique par PR : empêche les runs simultanés
+  group: race-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: false  # On ne cancel pas, on sérialise
+
+jobs:
+  auto-merge:
+    if: contains(github.event.pull_request.labels.*.name, 'automerge')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Checks
+        run: gh pr checks ${{ github.event.pull_request.number }} --watch
+      - name: Merge with Retry
+        run: |
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          until [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
+            if gh pr merge --squash --auto ${{ github.event.pull_request.number }}; then
+              echo "Merge successful"
+              exit 0
+            fi
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "Merge failed. Retry $RETRY_COUNT/$MAX_RETRIES in 10s..."
+            sleep 10
+          done
+          echo "Max retries reached. Merge failed."
+          exit 1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
