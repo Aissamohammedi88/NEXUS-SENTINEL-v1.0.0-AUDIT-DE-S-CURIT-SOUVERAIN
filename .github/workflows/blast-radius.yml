@@ -3,13 +3,10 @@
 # BLAST RADIUS ANALYSIS — Calcule l'impact réel d'une mise à jour
 # Feature inédite : aucun outil ne fait ça automatiquement.
 # ═══════════════════════════════════════════════════════════════════════════════
-
 name: Blast Radius Analysis
-
 on:
   pull_request:
     types: [opened, synchronize]
-
 jobs:
   analyze:
     runs-on: ubuntu-latest
@@ -17,7 +14,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Detect Changed Dependencies
         id: changed
         run: |
@@ -28,7 +24,6 @@ jobs:
           echo "CHANGED_DEPS<<EOF" >> $GITHUB_OUTPUT
           cat /tmp/changed_deps.txt >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
-
       - name: Calculate Blast Radius
         id: radius
         run: |
@@ -47,14 +42,11 @@ jobs:
               TOTAL_IMPACT=$((TOTAL_IMPACT + AFFECTED))
             fi
           done < /tmp/changed_deps.txt
-
           echo "TOTAL_IMPACT=$TOTAL_IMPACT" >> $GITHUB_OUTPUT
-
       - name: Compute Risk Score
         id: risk
         run: |
           IMPACT=${{ steps.radius.outputs.TOTAL_IMPACT }}
-          
           # Calcul du score de risque (0-100)
           if [ "$IMPACT" -eq 0 ]; then
             RISK=0; LEVEL="🟢 FAIBLE"; ACTION="Auto-merge autorisé"
@@ -67,11 +59,9 @@ jobs:
           else
             RISK=100; LEVEL="⛔ EXTRÊME"; ACTION="Bloquer le merge"
           fi
-          
           echo "RISK=$RISK" >> $GITHUB_OUTPUT
           echo "LEVEL=$LEVEL" >> $GITHUB_OUTPUT
           echo "ACTION=$ACTION" >> $GITHUB_OUTPUT
-
       - name: Publish Blast Radius Report
         run: |
           {
@@ -86,7 +76,6 @@ jobs:
             echo "---"
             echo "*Calculé par Nexus Prime Layer*"
           } >> $GITHUB_STEP_SUMMARY
-
       - name: Block Merge if Extreme Risk
         if: steps.risk.outputs.RISK >= 100
         run: |
