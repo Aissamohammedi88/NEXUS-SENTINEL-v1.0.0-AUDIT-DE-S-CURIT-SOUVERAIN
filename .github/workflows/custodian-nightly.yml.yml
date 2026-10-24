@@ -1,0 +1,17 @@
+# .github/workflows/custodian-nightly.yml
+name: Custodian Nightly
+on:
+  schedule:
+    - cron: '0 2 * * *' # 2h du matin
+jobs:
+  cleanup:
+    name: "🧹 Custodian — Nightly Cleanup"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clean Old Artifacts
+        run: |
+          # Supprime les artefacts de plus de 7 jours
+          find ./artifacts -type f -mtime +7 -delete
+      - name: Vacuum Database
+        run: sqlite3 data.db "VACUUM;"
