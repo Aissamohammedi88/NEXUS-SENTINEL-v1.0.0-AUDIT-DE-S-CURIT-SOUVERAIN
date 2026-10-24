@@ -1,0 +1,57 @@
+# .github/workflows/conflict-prophet.yml
+name: Conflict Prophet
+on:
+  schedule:
+    - cron: '0 9 * * *'  # Tous les jours à 9h
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Fetch All Branches
+        run: |
+          git fetch --all --prune
+      - name: Detect Future Conflicts
+        run: |
+          python3 << 'EOF'
+          import subprocess, itertools
+          branches = subprocess.check_output(
+              ['git', 'branch', '-r', '--format=%(refname:short)']
+          ).decode().splitlines()
+          branches = [b for b in branches if 'origin/main' not in b and 'HEAD' not in b]
+          for branch_a, branch_b in itertools.combinations(branches, 2):
+              # Merge dry-run pour détecter les conflits potentiels
+              result = subprocess.run(
+                  ['git', 'merge-tree',
+                   f'$(git merge-base {branch_a} {branch_b})',
+                   branch_a, branch_b],
+                  capture_output=True, text=True
+              )
+              if '<<<<<<<' in result.stdout:
+                  print(f"⚠️ {branch_a} ←→ {branch_b} : conflit imminent")
+                  with open(f'/tmp/conflict-{branch_a.replace("/","-")}-{branch_b.replace("/","-")}.txt', 'w') as f:
+                     f.write(f"Conflict between {branch_a} and {branch_b}\n\n{result.stdout[:2000]}")
+          EOF
+      - name: Notify Developers
+        if: ${{ hashFiles('/tmp/conflict-*.txt') }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const conflicts = fs.readdirSync('/tmp').filter(f => f.startsWith('conflict-'));
+            for (const file of conflicts) {
+              const content = fs.readFileSync(`/tmp/${file}`, 'utf8');
+              const match = content.match(/Conflict between (\S+) and (\S+)/);
+              if (match) {
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `⚡ Merge conflict predicted: ${match[1]} ←→ ${match[2]}`,
+                  body: `Ces deux branches vont entrer en conflit si mergées en l'état.\n\n\`\`\`\n${content}\n\`\`\``,
+                  labels: ['conflict-prediction', 'automated']
+                });
+              }
+            }
