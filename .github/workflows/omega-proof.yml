@@ -1,0 +1,35 @@
+# .github/workflows/omega-proof.yml
+name: Omega Proof
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  verify:
+    name: "🔐 Omega Proof Verification"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate PR Proof
+        id: proof
+        run: |
+          # Concatène : SHA du commit + auteur + timestamp + titre PR
+          PROOF_RAW="${GITHUB_SHA}|${GITHUB_ACTOR}|${GITHUB_EVENT_PATH}|$(date +%s)"
+          PROOF_HASH=$(echo -n "$PROOF_RAW" | sha256sum | cut -d' ' -f1)
+          echo "PROOF=$PROOF_HASH" >> $GITHUB_OUTPUT
+          echo "### 🔐 Omega Proof" >> $GITHUB_STEP_SUMMARY
+          echo "Proof hash: \`$PROOF_HASH\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Verify Proof in PR Description
+        run: |
+          # La PR DOIT contenir la ligne "Proof: <hash>"
+          if ! grep -q "${{ steps.proof.outputs.PROOF }}" <<< "${{ github.event.pull_request.body }}"; then
+            echo "::error::Proof cryptographique absent du corps de la PR."
+            echo "Ajoutez la ligne: Proof: ${{ steps.proof.outputs.PROOF }}" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          echo "✓ Proof validée."
