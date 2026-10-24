@@ -1,0 +1,36 @@
+// renovate.json
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEXUS RENOVATE — Mise à jour automatisée des dépendances
+// ═══════════════════════════════════════════════════════════════════════════════
+
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    ":semanticCommits"
+  ],
+  "schedule": ["before 6am on Monday"],
+  "timezone": "America/Montreal",
+  "automerge": false,
+  "platformAutomerge": true,
+  "packageRules": [
+    {
+      "description": "Grouper les mises à jour mineures et patchs",
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "all non-major dependencies",
+      "automerge": true
+    },
+    {
+      "description": "Ne jamais auto-merger les mises à jour majeures",
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    },
+    {
+      "description": "Séparer les mises à jour de sécurité",
+      "matchDatasources": ["pypi", "github-actions"],
+      "matchUpdateTypes": ["patch"],
+      "groupName": "security patches",
+      "automerge": true
+    }
+  ]
+}
