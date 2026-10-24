@@ -1,20 +1,52 @@
-# .github/workflows/steward-auto-merge.yml
-name: Steward Auto-Merge
+# .github/workflows/scope-integrity.yml
+name: Scope Integrity
+
 on:
   pull_request:
-    types: [labeled]
+    types: [opened, synchronize]
+
 jobs:
-  merge:
-    name: "⚙️ Steward — Safe Auto-Merge"
-    if: contains(github.event.pull_request.labels.*.name, 'automerge')
+  verify:
+    name: "📏 Scope Verification"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify Status Checks
+        with:
+          fetch-depth: 0
+
+      - name: Calculate Scope
+        id: scope
         run: |
-          # Ne fusionne que si tous les checks sont verts
-          gh pr checks ${{ github.event.pull_request.number }} --watch
-      - name: Merge PR
-        run: gh pr merge --squash --auto ${{ github.event.pull_request.number }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Compte les fichiers modifiés
+          CHANGED_FILES=$(git diff --name-only origin/main...HEAD | wc -l)
+          echo "CHANGED=$CHANGED_FILES" >> $GITHUB_OUTPUT
+          
+          # Extrait le type de la PR (fix, feat, chore, docs)
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_TYPE=$(echo "$PR_TITLE" | grep -oE "^(fix|feat|chore|docs|refactor|test|ci|perf|build)")
+          echo "TYPE=$PR_TYPE" >> $GITHUB_OUTPUT
+
+      - name: Verify Scope Limits
+        run: |
+          CHANGED=${{ steps.scope.outputs.CHANGED }}
+          TYPE=${{ steps.scope.outputs.TYPE }}
+          
+          # Limites par type de PR
+          case "$TYPE" in
+            fix)     MAX=5 ;;
+            docs)    MAX=3 ;;
+            chore)   MAX=10 ;;
+            feat)    MAX=20 ;;
+            refactor) MAX=30 ;;
+            *)       MAX=15 ;;
+          esac
+          
+          echo "Type: $TYPE | Fichiers modifiés: $CHANGED | Limite: $MAX"
+          
+          if [ "$CHANGED" -gt "$MAX" ]; then
+            echo "::error::Scope dépassé : $CHANGED fichiers modifiés (max $MAX pour '$TYPE')."
+            echo "### 📏 Scope Violation" >> $GITHUB_STEP_SUMMARY
+            echo "Type \`$TYPE\` autorise max \`$MAX\` fichiers, mais \`$CHANGED\` ont été modifiés." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          echo "✓ Scope respecté."
