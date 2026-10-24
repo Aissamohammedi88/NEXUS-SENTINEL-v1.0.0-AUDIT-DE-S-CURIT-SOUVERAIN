@@ -1,0 +1,45 @@
+# .github/workflows/cost-predict.yml
+name: Cost Prediction
+on:
+  pull_request:
+    types: [opened, synchronize]
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Estimate CI Cost
+        id: cost
+        run: |
+          # Nombre de fichiers modifiés
+          FILES_CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | wc -l)
+          # Nombre de lignes modifiées
+          LINES_CHANGED=$(git diff --stat origin/${{ github.base_ref }}...HEAD | tail -1 | awk '{print $4+$6}')
+          # Nombre de workflows qui vont se déclencher
+          WORKFLOWS=$(ls .github/workflows/*.yml | wc -l)
+          # Estimation : 30s de runner par fichier + 0.5s par ligne
+          ESTIMATED_MINUTES=$(echo "($FILES_CHANGED * 0.5) + ($LINES_CHANGED * 0.01) + ($WORKFLOWS * 2)" | bc | cut -d. -f1)
+          # Coût : $0.008/minute (tarif GitHub Actions Linux)
+          ESTIMATED_COST=$(echo "$ESTIMATED_MINUTES * 0.008" | bc)
+          echo "FILES=$FILES_CHANGED" >> $GITHUB_OUTPUT
+          echo "MINUTES=$ESTIMATED_MINUTES" >> $GITHUB_OUTPUT
+          echo "COST=$ESTIMATED_COST" >> $GITHUB_OUTPUT
+      - name: Post Cost Summary
+        run: |
+          {
+            echo "### 💰 CI Cost Prediction"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Files Changed | ${{ steps.cost.outputs.FILES }} |"
+            echo "| Estimated CI Time | ${{ steps.cost.outputs.MINUTES }} min |"
+            echo "| Estimated Cost | \$${{ steps.cost.outputs.COST }} USD |"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Block if Cost Exceeds Threshold
+        if: ${{ steps.cost.outputs.MINUTES > 30 }}
+        run: |
+          echo "::error::Cette PR coûtera ~${{ steps.cost.outputs.MINUTES }} min de CI (>30 min). Découpez-la."
+          exit 1
