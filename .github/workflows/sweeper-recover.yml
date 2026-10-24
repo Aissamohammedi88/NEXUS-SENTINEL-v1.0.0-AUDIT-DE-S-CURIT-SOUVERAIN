@@ -1,0 +1,16 @@
+# .github/workflows/sweeper-recover.yml
+name: Sweeper Recover
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+jobs:
+  recover:
+    name: "♻️ Sweeper — Post-Failure Recovery"
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Re-run Failed Jobs
+        run: |
+          gh run rerun ${{ github.event.workflow_run.id }} --failed
