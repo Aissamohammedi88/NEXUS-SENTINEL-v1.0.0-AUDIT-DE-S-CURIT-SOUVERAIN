@@ -3,19 +3,15 @@
 # MULTI-AGENT CONSENSUS — 3 agents votent avant chaque merge
 # Feature inédite : aucun outil ne fait de vote démocratique.
 # ═══════════════════════════════════════════════════════════════════════════════
-
 name: Multi-Agent Consensus
-
 on:
   pull_request:
     types: [opened, synchronize, labeled]
-
 jobs:
   consensus:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Agent SECURITY — Vote
         id: security
         run: |
@@ -28,10 +24,9 @@ jobs:
             VOTE="REVIEW"
             REASON="Critical dependency changed"
           fi
-          
+  
           echo "VOTE=$VOTE" >> $GITHUB_OUTPUT
           echo "REASON=$REASON" >> $GITHUB_OUTPUT
-
       - name: Agent QUALITY — Vote
         id: quality
         run: |
