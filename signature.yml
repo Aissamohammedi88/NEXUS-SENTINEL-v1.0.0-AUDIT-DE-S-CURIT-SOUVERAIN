@@ -1,0 +1,36 @@
+# .github/workflows/sovereign-signature.yml
+name: Sovereign Signature
+on:
+  pull_request:
+jobs:
+  verify:
+    name: "👑 Sovereign Signature Check"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify All Commits Signed by Main Owner
+        run: |
+          # Signature GPG attendue du mainteneur (à récupérer une fois via gpg --fingerprint)
+          EXPECTED_KEY="4A8E3B2C1F5D6E7F8A9B0C1D2E3F4A5B6C7D8E9F"
+          
+          # Liste tous les commits de la PR
+          COMMITS=$(git log origin/main..HEAD --format="%H")
+          
+          FAILED=0
+          for commit in $COMMITS; do
+            # Récupère la clé GPG qui a signé ce commit
+            SIG_KEY=$(git log -1 --format="%GK" "$commit")
+            
+            if [ "$SIG_KEY" != "$EXPECTED_KEY" ]; then
+              echo "::error::Commit $commit signé par une clé non autorisée : $SIG_KEY"
+              FAILED=1
+            fi
+          done
+          if [ $FAILED -eq 1 ]; then
+            echo "### 👑 Signature Violation" >> $GITHUB_STEP_SUMMARY
+            echo "Seule la clé \`$EXPECTED_KEY\` est autorisée." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          echo "✓ Tous les commits sont signés par la clé souveraine."
