@@ -1,0 +1,36 @@
+# .github/workflows/determinism-guard.yml
+name: Determinism Guard
+
+on:
+  pull_request:
+
+jobs:
+  verify:
+    name: "🎯 Determinism Verification"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run 10 times and compare outputs
+        run: |
+          # Exécute un script de test 10 fois et compare les hashes
+          SCRIPT="tests/determinism_test.py"
+          HASHES=()
+          
+          for i in $(seq 1 10); do
+            OUTPUT=$(python3 $SCRIPT 2>&1)
+            HASH=$(echo -n "$OUTPUT" | sha256sum | cut -d' ' -f1)
+            HASHES+=("$HASH")
+            echo "Run $i: $HASH"
+          done
+          
+          # Vérifie que tous les hashes sont identiques
+          UNIQUE_COUNT=$(printf '%s\n' "${HASHES[@]}" | sort -u | wc -l)
+          if [ "$UNIQUE_COUNT" -ne 1 ]; then
+            echo "::error::Code non-déterministe détecté ($UNIQUE_COUNT hashes distincts sur 10 runs)."
+            exit 1
+          fi
+          echo "✓ Code déterministe : hash stable sur 10 exécutions."
