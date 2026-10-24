@@ -1,0 +1,108 @@
+# .github/workflows/predictive-tests.yml
+# ═══════════════════════════════════════════════════════════════════════════════
+# PREDICTIVE TEST SELECTION — Lance uniquement les tests affectés
+# Feature inédite : aucun outil ne fait de prédiction de tests impactés.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Predictive Test Selection
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    outputs:
+      selected-tests: ${{ steps.select.outputs.TESTS }}
+      full-suite: ${{ steps.select.outputs.FULL_SUITE }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect Changed Modules
+        id: changed
+        run: |
+          # Liste les modules Python modifiés
+          git diff origin/main --name-only | grep -E '\.py$' | \
+            sed 's|/[^/]*$||' | sort -u > /tmp/changed_modules.txt || true
+          
+          echo "CHANGED_MODULES<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/changed_modules.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Predict Affected Tests
+        id: select
+        run: |
+          > /tmp/affected_tests.txt
+          FULL_SUITE="false"
+          
+          while IFS= read -r module; do
+            [ -z "$module" ] && continue
+            
+            # Convertit le chemin module en pattern de test
+            # Ex: "src/api" -> "tests/test_api*.py"
+            TEST_PATTERN="tests/test_$(basename "$module")*.py"
+            
+            MATCHES=$(ls $TEST_PATTERN 2>/dev/null || true)
+            if [ -n "$MATCHES" ]; then
+              echo "$MATCHES" >> /tmp/affected_tests.txt
+            else
+              # Aucun test spécifique trouvé -> lancer la suite complète
+              FULL_SUITE="true"
+              break
+            fi
+          done < /tmp/changed_modules.txt
+          
+          # Déduplique
+          sort -u /tmp/affected_tests.txt > /tmp/final_tests.txt
+          
+          echo "TESTS<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/final_tests.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "FULL_SUITE=$FULL_SUITE" >> $GITHUB_OUTPUT
+
+      - name: Report Prediction
+        run: |
+          TEST_COUNT=$(wc -l < /tmp/final_tests.txt 2>/dev/null || echo 0)
+          {
+            echo "### 🎯 Predictive Test Selection"
+            echo ""
+            echo "**Modules modifiés** :"
+            cat /tmp/changed_modules.txt 2>/dev/null | sed 's/^/- /'
+            echo ""
+            echo "**Tests sélectionnés** : $TEST_COUNT"
+            if [ "${{ steps.select.outputs.FULL_SUITE }}" = "true" ]; then
+              echo "⚠️ Suite complète requise (aucun test spécifique trouvé)"
+            else
+              echo "✅ Sélection prédictive appliquée"
+              echo ""
+              echo "<details><summary>Voir les tests</summary>"
+              echo ""
+              echo '```'
+              cat /tmp/final_tests.txt
+              echo '```'
+              echo "</details>"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
+  test:
+    needs: predict
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Dependencies
+        run: pip install -e ".[dev]"
+      - name: Run Selected Tests
+        run: |
+          if [ "${{ needs.predict.outputs.full-suite }}" = "true" ]; then
+            echo "Running full test suite..."
+            pytest tests/ -v
+          else
+            echo "Running predicted tests..."
+            pytest ${{ needs.predict.outputs.selected-tests }} -v
+          fi
