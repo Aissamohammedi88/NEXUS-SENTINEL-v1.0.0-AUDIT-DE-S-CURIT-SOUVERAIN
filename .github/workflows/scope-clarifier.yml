@@ -1,10 +1,8 @@
 # .github/workflows/scope-clarifier.yml
 name: Scope Clarifier
-
 on:
   pull_request:
     types: [opened, synchronize]
-
 jobs:
   clarify:
     runs-on: ubuntu-latest
@@ -18,7 +16,6 @@ jobs:
           echo "DEPS<<EOF" >> $GITHUB_OUTPUT
           cat /tmp/changed-deps.txt >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
-
       - name: Generate Decision Tree
         run: |
           {
