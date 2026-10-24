@@ -1,0 +1,37 @@
+# .github/workflows/scope-clarifier.yml
+name: Scope Clarifier
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  clarify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract Changed Dependencies
+        id: deps
+        run: |
+          # Détecte les changements dans pyproject.toml
+          git diff origin/main -- pyproject.toml | grep '^+' | grep -v '^+++' > /tmp/changed-deps.txt || true
+          echo "DEPS<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/changed-deps.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Generate Decision Tree
+        run: |
+          {
+            echo "### 🌳 Dependency Decision Tree"
+            echo ""
+            echo '```mermaid'
+            echo 'graph TD'
+            echo '    A[New Dependency Change] --> B{Is it security-related?}'
+            echo '    B -->|Yes| C[Auto-merge if CI passes]'
+            echo '    B -->|No| D{Is it a major version?}'
+            echo '    D -->|Yes| E[Manual review required]'
+            echo '    D -->|No| F{Does it affect public API?}'
+            echo '    F -->|Yes| G[Run integration tests]'
+            echo '    F -->|No| H[Auto-merge if lint passes]'
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
