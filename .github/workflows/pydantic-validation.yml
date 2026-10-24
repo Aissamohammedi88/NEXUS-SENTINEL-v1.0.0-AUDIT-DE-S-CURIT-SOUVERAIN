@@ -1,114 +1,49 @@
-# .github/workflows/auto-rollback.yml
-# ═══════════════════════════════════════════════════════════════════════════════
-# AUTO-ROLLBACK WITH CONFIDENCE — Rollback basé sur les métriques réelles
-# Feature inédite : aucun outil ne fait de rollback post-merge automatique.
-# ═══════════════════════════════════════════════════════════════════════════════
-
-name: Auto-Rollback with Confidence
+# .github/workflows/hallucination-scanner.yml
+name: Hallucination Scanner
 
 on:
-  push:
-    branches: [main]
+  pull_request:
 
 jobs:
-  monitor:
+  scan:
+    name: "🧠 Hallucination Detection"
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          fetch-depth: 2
+          python-version: '3.12'
 
-      - name: Baseline Snapshot (Before)
-        id: baseline
+      - name: Scan for Hallucinated Dependencies
         run: |
-          # Capture l'état AVANT le déploiement
-          # (Adapter selon ton infra : latence, erreurs, RAM, etc.)
-          BASELINE_LATENCY=$(curl -s -o /dev/null -w "%{time_total}" https://api.example.com/health || echo "0")
-          BASELINE_ERROR_RATE="0.01"  # À récupérer depuis ton monitoring
+          # Extrait tous les imports du code
+          grep -rhoE "^(import|from) [a-zA-Z_][a-zA-Z0-9_]*" --include="*.py" . | \
+            awk '{print $2}' | cut -d'.' -f1 | sort -u > /tmp/imports.txt
           
-          echo "LATENCY=$BASELINE_LATENCY" >> $GITHUB_OUTPUT
-          echo "ERROR_RATE=$BASELINE_ERROR_RATE" >> $GITHUB_OUTPUT
-
-      - name: Wait for Deployment
-        run: |
-          echo "Waiting 60s for deployment to stabilize..."
-          sleep 60
-
-      - name: Post-Deploy Metrics (After)
-        id: after
-        run: |
-          AFTER_LATENCY=$(curl -s -o /dev/null -w "%{time_total}" https://api.example.com/health || echo "0")
-          AFTER_ERROR_RATE="0.02"  # À récupérer depuis ton monitoring
+          FAILED=0
+          while read -r pkg; do
+            # Vérifie que le package existe sur PyPI
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/$pkg/json")
+            if [ "$HTTP_CODE" = "404" ]; then
+              echo "::error::Package halluciné détecté: $pkg (non trouvé sur PyPI)"
+              FAILED=1
+            fi
+          done < /tmp/imports.txt
           
-          echo "LATENCY=$AFTER_LATENCY" >> $GITHUB_OUTPUT
-          echo "ERROR_RATE=$AFTER_ERROR_RATE" >> $GITHUB_OUTPUT
-
-      - name: Compute Confidence Score
-        id: confidence
-        run: |
-          BEFORE_LAT="${{ steps.baseline.outputs.LATENCY }}"
-          AFTER_LAT="${{ steps.after.outputs.LATENCY }}"
-          BEFORE_ERR="${{ steps.baseline.outputs.ERROR_RATE }}"
-          AFTER_ERR="${{ steps.after.outputs.ERROR_RATE }}"
-          
-          # Calcul du delta (en %)
-          LAT_DELTA=$(awk "BEGIN {printf \"%.2f\", (($AFTER_LAT - $BEFORE_LAT) / $BEFORE_LAT) * 100}")
-          ERR_DELTA=$(awk "BEGIN {printf \"%.2f\", (($AFTER_ERR - $BEFORE_ERR) / $BEFORE_ERR) * 100}")
-          
-          # Score de confiance (0-100)
-          # 100 = aucune dégradation, 0 = catastrophe
-          if (( $(echo "$LAT_DELTA > 50" | bc -l) )); then
-            CONFIDENCE=0
-            DECISION="ROLLBACK_IMMEDIATE"
-          elif (( $(echo "$ERR_DELTA > 30" | bc -l) )); then
-            CONFIDENCE=20
-            DECISION="ROLLBACK_IMMEDIATE"
-          elif (( $(echo "$LAT_DELTA > 20 || $ERR_DELTA > 10" | bc -l) )); then
-            CONFIDENCE=50
-            DECISION="MONITOR_CLOSELY"
-          elif (( $(echo "$LAT_DELTA > 5 || $ERR_DELTA > 5" | bc -l) )); then
-            CONFIDENCE=75
-            DECISION="ACCEPTABLE"
-          else
-            CONFIDENCE=100
-            DECISION="PERFECT"
+          if [ $FAILED -eq 1 ]; then
+            exit 1
           fi
-          
-          echo "CONFIDENCE=$CONFIDENCE" >> $GITHUB_OUTPUT
-          echo "DECISION=$DECISION" >> $GITHUB_OUTPUT
-          echo "LAT_DELTA=$LAT_DELTA" >> $GITHUB_OUTPUT
-          echo "ERR_DELTA=$ERR_DELTA" >> $GITHUB_OUTPUT
+          echo "✓ Aucun package halluciné détecté."
 
-      - name: Report Confidence
+      - name: Scan for Hallucinated URLs
         run: |
-          {
-            echo "### 🔄 Auto-Rollback Analysis"
-            echo ""
-            echo "| Metric | Before | After | Delta |"
-            echo "|--------|--------|-------|-------|"
-            echo "| Latency | ${{ steps.baseline.outputs.LATENCY }}s | ${{ steps.after.outputs.LATENCY }}s | ${{ steps.confidence.outputs.LAT_DELTA }}% |"
-            echo "| Error Rate | ${{ steps.baseline.outputs.ERROR_RATE }} | ${{ steps.after.outputs.ERROR_RATE }} | ${{ steps.confidence.outputs.ERR_DELTA }}% |"
-            echo ""
-            echo "**Confidence Score** : ${{ steps.confidence.outputs.CONFIDENCE }}/100"
-            echo "**Decision** : ${{ steps.confidence.outputs.DECISION }}"
-          } >> $GITHUB_STEP_SUMMARY
-
-      - name: Auto-Rollback if Critical
-        if: steps.confidence.outputs.CONFIDENCE == '0'
-        run: |
-          echo "::error::Confidence score is 0/100. Triggering automatic rollback..."
+          # Extrait toutes les URLs du code
+          grep -rhoE "https?://[^\"' >]+" --include="*.py" --include="*.md" . | sort -u > /tmp/urls.txt
           
-          # Rollback au commit précédent
-          PREVIOUS_COMMIT=$(git rev-parse HEAD~1)
-          git revert HEAD --no-edit
-          git push origin main
-          
-          # Crée une issue pour tracer
-          gh issue create \
-            --title "🚨 Auto-Rollback triggered at $(date +%Y-%m-%d)" \
-            --body "Confidence score dropped to 0. Rollback automatically triggered. Investigate commit $(git rev-parse HEAD~1)." \
-            --label "incident,auto-rollback"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILED=0
+          while read -r url; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url" || echo "000")
+            if [ "$HTTP_CODE" = "000" ] || [ "$HTTP_CODE" = "404" ]; then
+              echo "::warning::URL potentiellement hallucinée: $url (HTTP $HTTP_CODE)"
+            fi
+          done < /tmp/urls.txt
