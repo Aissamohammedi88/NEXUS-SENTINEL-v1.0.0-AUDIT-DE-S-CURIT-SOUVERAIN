@@ -1,0 +1,47 @@
+# .github/workflows/what-if.yml
+name: What-If Simulation
+on:
+  pull_request:
+    types: [opened, synchronize]
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 500  # Historique complet pour analyse
+      - name: Analyze Fragility Patterns
+        run: |
+          python3 << 'EOF'
+          import subprocess, json
+          # Récupère les 500 derniers commits
+          commits = subprocess.check_output(
+              ['git', 'log', '--pretty=format:%H|%s', '-500']
+          ).decode().splitlines()
+          # Corrèle les commits de dépendances avec les CI failures
+          fragility = {}
+          for c in commits:
+              sha, msg = c.split('|', 1)
+              if 'deps' in msg.lower() or 'upgrade' in msg.lower():
+                  # Check si le CI a échoué dans les 72h suivantes
+                  failures = subprocess.check_output([
+                      'gh', 'run', 'list', '--commit', sha, '--json',
+                      'conclusion,createdAt'
+                  ]).decode()
+                  if 'failure' in failures:
+                      fragility[msg[:50]] = "HIGH"
+          with open('/tmp/fragility.json', 'w') as f:
+              json.dump(fragility, f)
+          print(f"Detected {len(fragility)} fragile patterns")
+          EOF
+      - name: Generate What-If Report
+        run: |
+          {
+            echo "### 🔮 What-If Simulation"
+            echo ""
+            echo "**Basé sur les 500 derniers commits**, voici les patterns de fragilité :"
+            echo ""
+            echo "| Pattern | Risque de CI Failure |"
+            echo "|---------|----------------------|"
+            jq -r 'to_entries[] | "| \(.key) | \(.value) |"' /tmp/fragility.json 2>/dev/null || echo "| Aucun pattern détecté | - |"
+          } >> $GITHUB_STEP_SUMMARY
