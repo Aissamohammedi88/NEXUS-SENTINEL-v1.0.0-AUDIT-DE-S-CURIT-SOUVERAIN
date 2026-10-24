@@ -1,0 +1,29 @@
+# .github/workflows/dep-tree.yml
+name: Dependency Tree Visualization
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'  # Lundi à 6h
+
+jobs:
+  tree:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Generate Dependency Tree
+        run: |
+          pip install pipdeptree
+          pipdeptree --json-tree > deps-tree.json
+          echo "### 📦 Dependency Tree" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          pipdeptree --warn silence | head -n 50 >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+      - name: Upload Tree Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-tree
+          path: deps-tree.json
