@@ -1,0 +1,45 @@
+# .github/workflows/health-check.yml
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEXUS HEALTH CHECK — Surveillance de l'état du terminal
+# Inspiré de : PaperclipAI, n8n workflow templates
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Scheduled Health Check
+
+on:
+  schedule:
+    # Toutes les 30 min pendant les heures ouvrées (06:00–22:00 UTC, Lun-Ven)
+    - cron: '*/30 6-22 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  health:
+    name: "❤️ Health Check"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe Health Endpoint
+        id: probe
+        run: |
+          # Remplacer par l'URL réelle de ton health endpoint
+          HEALTH_URL="${{ vars.HEALTH_CHECK_URL || 'http://localhost:8000/health' }}"
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL" || echo "000")
+          echo "HTTP_CODE=$HTTP_CODE" >> $GITHUB_OUTPUT
+
+      - name: Create Issue on Failure
+        if: steps.probe.outputs.HTTP_CODE != '200'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Health Check Failed (HTTP ${process.env.HTTP_CODE})`,
+              body: `The health check at \`${{ vars.HEALTH_CHECK_URL }}\` returned HTTP ${process.env.HTTP_CODE} at ${new Date().toISOString()}.\n\nPlease investigate.`,
+              labels: ['incident', 'automated']
+            })
+        env:
+          HTTP_CODE: ${{ steps.probe.outputs.HTTP_CODE }}
