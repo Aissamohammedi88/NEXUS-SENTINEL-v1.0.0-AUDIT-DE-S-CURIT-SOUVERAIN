@@ -1,10 +1,8 @@
 # .github/workflows/race-guard.yml
 name: Race Condition Guard
-
 on:
   pull_request:
     types: [labeled]
-
 concurrency:
   # Groupe de concurrence unique par PR : empêche les runs simultanés
   group: race-guard-${{ github.event.pull_request.number }}
