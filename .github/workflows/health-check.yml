@@ -1,45 +1,48 @@
-# .github/workflows/health-check.yml
-# ═══════════════════════════════════════════════════════════════════════════════
-# NEXUS HEALTH CHECK — Surveillance de l'état du terminal
-# Inspiré de : PaperclipAI, n8n workflow templates
-# ═══════════════════════════════════════════════════════════════════════════════
-
-name: Scheduled Health Check
+# .github/workflows/context-drift.yml
+name: Context Drift
 
 on:
   schedule:
-    # Toutes les 30 min pendant les heures ouvrées (06:00–22:00 UTC, Lun-Ven)
-    - cron: '*/30 6-22 * * 1-5'
+    - cron: '0 8 * * 1'  # Lundi 8h
   workflow_dispatch:
 
-permissions:
-  issues: write
-  contents: read
-
 jobs:
-  health:
-    name: "❤️ Health Check"
+  detect:
+    name: "🔍 Drift Detection"
     runs-on: ubuntu-latest
     steps:
-      - name: Probe Health Endpoint
-        id: probe
-        run: |
-          # Remplacer par l'URL réelle de ton health endpoint
-          HEALTH_URL="${{ vars.HEALTH_CHECK_URL || 'http://localhost:8000/health' }}"
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL" || echo "000")
-          echo "HTTP_CODE=$HTTP_CODE" >> $GITHUB_OUTPUT
-
-      - name: Create Issue on Failure
-        if: steps.probe.outputs.HTTP_CODE != '200'
-        uses: actions/github-script@v7
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          script: |
-            github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `🚨 Health Check Failed (HTTP ${process.env.HTTP_CODE})`,
-              body: `The health check at \`${{ vars.HEALTH_CHECK_URL }}\` returned HTTP ${process.env.HTTP_CODE} at ${new Date().toISOString()}.\n\nPlease investigate.`,
-              labels: ['incident', 'automated']
-            })
-        env:
-          HTTP_CODE: ${{ steps.probe.outputs.HTTP_CODE }}
+          python-version: '3.12'
+
+      - name: Extract Version from Code
+        id: code
+        run: |
+          # Extrait la version depuis pyproject.toml ou __init__.py
+          if [ -f pyproject.toml ]; then
+            CODE_VERSION=$(grep '^version' pyproject.toml | cut -d'"' -f2)
+          elif [ -f src/__init__.py ]; then
+            CODE_VERSION=$(grep '__version__' src/__init__.py | cut -d'"' -f2)
+          fi
+          echo "VERSION=$CODE_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Extract Version from README
+        id: readme
+        run: |
+          README_VERSION=$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' README.md | head -n1 | tr -d 'v')
+          echo "VERSION=$README_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Compare Versions
+        run: |
+          CODE=${{ steps.code.outputs.VERSION }}
+          README=${{ steps.readme.outputs.VERSION }}
+          
+          if [ "$CODE" != "$README" ]; then
+            echo "::error::Drift détecté : code=$CODE, README=$README"
+            echo "### 🔍 Context Drift Detected" >> $GITHUB_STEP_SUMMARY
+            echo "- Code version: \`$CODE\`" >> $GITHUB_STEP_SUMMARY
+            echo "- README version: \`$README\`" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          echo "✓ Aucune dérive détectée."
