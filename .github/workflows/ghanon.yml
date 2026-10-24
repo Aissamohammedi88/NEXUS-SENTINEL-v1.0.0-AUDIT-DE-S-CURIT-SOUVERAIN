@@ -1,0 +1,20 @@
+# .github/workflows/validate-workflows.yml
+name: Validate Workflows (Pydantic)
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install Ghanon
+        run: pip install ghanon
+      - name: Validate all workflows
+        run: ghanon .github/workflows/*.yml
