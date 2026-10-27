@@ -40,7 +40,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
       - name: Setup Ruby (for Linguist)
         uses: ruby/setup-ruby@v1
         with:
@@ -55,7 +54,6 @@ jobs:
           LANGUAGES=$(github-linguist --breakdown --json | jq -r 'keys[]' | tr '\n' ' ')
           echo "languages=$LANGUAGES" >> $GITHUB_OUTPUT
           echo "Detected languages: $LANGUAGES"
-
   # ─── JOB 2 : AUTO-FIX MULTI-LANGAGES ────────────────────────────────────────
   # Utilise des outils spécialisés par langage. Chaque outil est exécuté
   # conditionnellement si le langage est détecté.
@@ -182,7 +180,6 @@ jobs:
         run: |
           # Met à jour toutes les actions dans .github/workflows/
           gh aw update --all
-      
       - name: Commit Changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
