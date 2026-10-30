@@ -81,7 +81,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 21
+          java-version: 22
           cache: maven
       - name: 'Dependency-check (CVE des dépendances)'
         run: mvn -B -ntp org.owasp:dependency-check-maven:check -DskipTests
@@ -91,8 +91,7 @@ jobs:
         with:
           name: nexus-owasp-report
           path: target/dependency-check-report.html
-          retention-days: 14
-          if-no-files-found: ignore
+          retention-days: 14          if-no-files-found: ignore
 
   # -------------------------------------------------------------------
   # JOB 3/3 : codeql — analyse statique de sécurité Java.
