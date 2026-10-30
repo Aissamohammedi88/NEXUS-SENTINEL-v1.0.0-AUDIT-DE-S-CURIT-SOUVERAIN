@@ -1,0 +1,145 @@
+# =============================================================================
+# NEXUS DOCKER — pipeline image multi-arch
+# Généré par NEXUS CI GENERATOR v2.0.0 le 2026-10-30T05:56:53Z (type: docker)
+# Fichier: .nexus-tmp.HG7wLZ | Branche: main | Registre: ghcr.io
+# -----------------------------------------------------------------------------
+# Chaîne de contrôle :
+#   1. lint   : hadolint sur le Dockerfile (best practices officielles)
+#   2. image  : buildx linux/amd64 + linux/arm64, cache gha, push hors PR
+#   3. scan   : Trivy sur l'IMAGE (exit 1 sur HIGH/CRITICAL)
+#   4. sbom   : SBOM SPDX de l'image (traçabilité supply chain)
+# Le push utilise GITHUB_TOKEN vers ghcr.io : aucun secret manuel.
+# =============================================================================
+name: 'NEXUS DOCKER (image multi-arch)'
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: 'nexus-docker-${{ github.ref }}'
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # -------------------------------------------------------------------
+  # JOB 1/4 : lint — hadolint. Un Dockerfile sale aujourd'hui, c'est
+  #   une image de 900 Mo et une attaque de surface demain.
+  # -------------------------------------------------------------------
+  lint:
+    name: 'Hadolint (Dockerfile)'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v4
+      - name: 'Hadolint'
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+  # -------------------------------------------------------------------
+  # JOB 2/4 : image — build multi-arch. metadata-action génère les
+  #   tags (sha, semver sur tag v*, latest sur release) et les labels
+  #   OCI (source, revision) pour une image traçable.
+  # -------------------------------------------------------------------
+  image:
+    name: 'Buildx multi-arch (amd64+arm64)'
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v4
+      - name: 'QEMU (émulation arm64)'
+        uses: docker/setup-qemu-action@v3
+      - name: 'Buildx'
+        uses: docker/setup-buildx-action@v3
+      - name: 'Login au registre (hors PR)'
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 'Tags et labels OCI'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: 'Build (et push hors PR)'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # -------------------------------------------------------------------
+  # JOB 3/4 : scan — Trivy sur l'image produite. Plus fort qu'un scan
+  #   filesystem : il voit les CVE du runtime de l'image elle-même.
+  # -------------------------------------------------------------------
+  scan:
+    name: 'Trivy (CVE image)'
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v4
+      - name: 'Trivy image scan (SARIF, bloquant)'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-image.sarif
+      - name: 'Uploader le SARIF'
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+  # -------------------------------------------------------------------
+  # JOB 4/4 : sbom — inventaire SPDX de l'image. Sans SBOM, impossible
+  #   de répondre à "quelles versions de log4j on shippe ?" en 2026.
+  # -------------------------------------------------------------------
+  sbom:
+    name: 'SBOM (SPDX)'
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v4
+      - name: 'Générer le SBOM de l image'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          format: spdx-json
+          artifact-name: nexus-sbom.spdx.json
